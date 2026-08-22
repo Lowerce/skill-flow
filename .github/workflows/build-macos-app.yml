@@ -1,0 +1,82 @@
+name: Build macOS artifacts from main
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Fork branch or tag to package"
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-artifacts-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-arm64:
+    name: Package unsigned arm64 app
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+
+    steps:
+      - name: Check out requested fork revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Record packaged revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release-compatible Apple toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          test "$(xcrun --sdk macosx --show-sdk-version)" = "26.5"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.2
+          cache: npm
+
+      - name: Install and build JavaScript packages
+        run: |
+          npm ci
+          npm run build
+
+      - name: Compile macOS app
+        working-directory: apps/desktop-mac
+        run: swift build --product SkillFlowDesktop
+
+      - name: Package and validate unsigned arm64 app
+        run: |
+          scripts/release/package-desktop-mac.sh \
+            --arch arm64 \
+            --output dist/ci-desktop-mac \
+            --skip-js-build
+          scripts/release/validate-mac-artifacts.sh \
+            "dist/ci-desktop-mac/arm64/Skill Flow.app" \
+            arm64
+          scripts/release/package-desktop-mac-zip.sh arm64 dist/ci-desktop-mac
+          scripts/release/generate-sha256.sh arm64 dist/ci-desktop-mac
+
+      - name: Upload unsigned app artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Skill-Flow-arm64-unsigned-${{ steps.source.outputs.sha }}
+          path: |
+            dist/ci-desktop-mac/arm64/Skill-Flow-arm64.zip
+            dist/ci-desktop-mac/arm64/Skill-Flow-arm64.dmg
+            dist/ci-desktop-mac/arm64/sha256.txt
+          if-no-files-found: error
+          retention-days: 14

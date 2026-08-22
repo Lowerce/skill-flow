@@ -58,6 +58,12 @@ done
   exit 1
 }
 
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+find "$NODE_RUNTIME_DIR" \
+  -path '*/bin/node' \
+  -type f \
+  -exec codesign --verify --strict --verbose=2 {} \;
+
 BUNDLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$INFO_PLIST")"
 DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$INFO_PLIST")"
 

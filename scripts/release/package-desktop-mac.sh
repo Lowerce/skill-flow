@@ -94,6 +94,7 @@ require_command node
 require_command curl
 require_command shasum
 require_command tar
+require_command codesign
 
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 BUILD_TS="$(date +%Y%m%d%H%M%S)"
@@ -377,6 +378,14 @@ EOF
 stage_helper "$HELPER_STAGE"
 cp -R "$HELPER_STAGE" "$APP_BUNDLE/Contents/Resources/helper"
 stage_node_runtimes
+
+# Downloaded apps are quarantined, so every embedded Mach-O must have a valid
+# signature. Re-sign the staged Node runtimes before sealing the outer bundle.
+find "$APP_BUNDLE/Contents/Resources/node" \
+  -path '*/bin/node' \
+  -type f \
+  -exec codesign --force --sign - {} \;
+codesign --force --sign - "$APP_BUNDLE"
 
 mkdir -p "$DMG_STAGE"
 cp -R "$APP_BUNDLE" "$DMG_STAGE/"
