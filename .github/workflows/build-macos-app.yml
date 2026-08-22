@@ -1,6 +1,9 @@
 name: Build macOS artifacts from main
 
 on:
+  push:
+    branches:
+      - build/macos-artifacts
   workflow_dispatch:
     inputs:
       source_ref:
@@ -13,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-artifacts-${{ inputs.source_ref }}
+  group: macos-artifacts-${{ inputs.source_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +31,7 @@ jobs:
       - name: Check out requested fork revision
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || 'main' }}
 
       - name: Record packaged revision
         id: source
