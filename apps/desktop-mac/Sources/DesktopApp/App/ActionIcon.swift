@@ -28,6 +28,7 @@ enum ActionIcon: String {
     case tagAdd = "tag-add"
     case tagDelete = "tag-delete"
     case update
+    case usage
 
     func image(size: CGFloat? = nil, isTemplate: Bool = true) -> NSImage? {
         if self == .searchSubmitEnter,
@@ -38,7 +39,6 @@ enum ActionIcon: String {
            let fallback = Self.systemSymbolImage("pencil", size: size, isTemplate: isTemplate) {
             return fallback
         }
-
         for directory in Self.resourceDirectories() {
             let url = directory.appendingPathComponent("\(rawValue).svg")
             if let image = NSImage(contentsOf: url) {

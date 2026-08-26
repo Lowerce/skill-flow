@@ -121,6 +121,343 @@ export type RecentProject = {
   tools?: string[];
 };
 
+export const USAGE_AGENTS = [
+  "claude-code",
+  "codex",
+  "cursor",
+  "github-copilot",
+  "gemini-cli",
+  "opencode",
+  "openclaw",
+  "hermes-agent",
+  "minimax-code",
+  "kimi-code",
+  "workbuddy",
+  "codebuddy",
+  "pi",
+  "trae",
+  "trae-cn",
+  "windsurf",
+  "roo-code",
+  "cline",
+  "amp",
+  "kiro",
+  "zcode",
+  "grok-build",
+  "copilot-cli",
+  "unknown",
+] as const;
+
+export type UsageAgent = typeof USAGE_AGENTS[number];
+
+export type UsageEvidenceKind =
+  | "skill_activated"
+  | "selected"
+  | "explicit_command"
+  | "tool_call";
+
+export type UsageConfidence = "observed" | "inferred";
+
+export type UsageOutcome = "completed" | "aborted" | "unknown";
+
+export type UsageSourceKind = "direct-event" | "local-session";
+
+export type UsageCoverageStatus =
+  | "scanned"
+  | "not_found"
+  | "no_records"
+  | "no_skill_signals"
+  | "partial"
+  | "parser_unsupported"
+  | "read_failed"
+  | "budget_exhausted";
+
+export type UsageSkillInventoryStatus =
+  | "installed"
+  | "not_installed"
+  | "unknown";
+
+export type UsageRefreshTrigger = "bootstrap" | "scheduled" | "manual";
+
+export type UsageRefreshStatus = "completed" | "partial" | "skipped";
+
+export type UsageDiagnosticCode =
+  | "SOURCE_NOT_FOUND"
+  | "NO_RECORDS"
+  | "NO_SKILL_SIGNALS"
+  | "PARSER_UNSUPPORTED"
+  | "READ_FAILED"
+  | "BUDGET_EXHAUSTED"
+  | "INVALID_RECORD_DROPPED"
+  | "UNMATCHED_SKILL"
+  | "STORAGE_WRITE_FAILED"
+  | "USAGE_SCHEMA_UNSUPPORTED";
+
+export type UsageDiagnostic = {
+  code: UsageDiagnosticCode;
+  agent: UsageAgent | null;
+  severity: "info" | "warning" | "error";
+  count: number;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+};
+
+export type UsageObservationV1 = {
+  schemaVersion: 1;
+  observationId: string;
+  observedAt: string;
+  agent: UsageAgent;
+  skillRef: SkillLeafId | null;
+  skillLabel?: string;
+  evidenceKind: UsageEvidenceKind;
+  confidence: UsageConfidence;
+  outcome: UsageOutcome;
+  sourceKind: UsageSourceKind;
+  parserRevision: string;
+  projectRef: string | null;
+  projectLabel: string;
+};
+
+export type UsageCollectorObservation = Omit<
+  UsageObservationV1,
+  "schemaVersion" | "observationId" | "skillRef"
+> & {
+  sourceEventId: string;
+  rawSkillName: string | null;
+  rawProjectPath?: string;
+};
+
+export type UsageRefreshBudget = {
+  globalBudgetMs: number;
+  perSourceBudgetMs: number;
+  maxFiles: number;
+  maxBytes: number;
+  cooldownSeconds: number;
+};
+
+export type UsageAgentCoverage = {
+  agent: UsageAgent;
+  sourceKind: UsageSourceKind | null;
+  parserRevision: string | null;
+  status: UsageCoverageStatus;
+  lastScannedAt: string | null;
+  coverageFrom: string | null;
+  coverageTo: string | null;
+  observedUses: number;
+  inferredSignals: number;
+  diagnosticsCount: number;
+  sourcesFound?: number;
+  sourceFilesScanned?: number;
+  sourceBytesScanned?: number;
+};
+
+export type UsageRefreshSummary = {
+  schemaVersion: 1;
+  refreshedAt: string;
+  trigger: UsageRefreshTrigger;
+  status: UsageRefreshStatus;
+  skippedReason?: "cooldown_active" | "usage_schema_unsupported";
+  budget: UsageRefreshBudget;
+  totals: {
+    sourcesFound: number;
+    sourcesScanned: number;
+    observedAccepted: number;
+    inferredAccepted: number;
+    duplicateSkipped: number;
+    droppedInvalid: number;
+    diagnosticsCount: number;
+  };
+  coverage: UsageAgentCoverage[];
+  diagnostics: UsageDiagnostic[];
+};
+
+export type UsageSnapshotFilters = {
+  range?: {
+    preset?: UsageRangePreset;
+    from?: string;
+    to?: string;
+  };
+  filters?: {
+    agents?: UsageAgent[];
+    skillRefs?: SkillLeafId[];
+    projectRefs?: string[];
+    confidence?: UsageConfidence[];
+    includeInferred?: boolean;
+  };
+  limits?: {
+    topSkills?: number;
+    topAgents?: number;
+    chartSkills?: number;
+    projects?: number;
+    matrixEntries?: number;
+    recentObservations?: number;
+  };
+};
+
+export type UsageRangePreset = "today" | "24h" | "7d" | "30d" | "90d" | "available" | "custom";
+
+export type UsageSkillIdentity = {
+  kind: "ref" | "label";
+  key: string;
+  skillRef: SkillLeafId | null;
+  skillLabel: string;
+};
+
+export type UsageKpis = {
+  observedUses: number;
+  activeSkills: number;
+  activeAgents: number;
+  activeProjects: number;
+  lastObservedAt: string | null;
+  inferredSignals: number;
+  totalSkills: number;
+  usedSkills: number;
+  skillRuns: number;
+  chatRecords: number;
+};
+
+export type UsageDailyBucket = {
+  date: string;
+  observedUses: number;
+  inferredSignals: number;
+  byAgent: Array<{
+    agent: UsageAgent;
+    observedUses: number;
+    inferredSignals: number;
+  }>;
+};
+
+export type UsageTopSkill = {
+  key: string;
+  skillRef: SkillLeafId | null;
+  skillLabel: string;
+  inventoryStatus: UsageSkillInventoryStatus;
+  observedUses: number;
+  inferredSignals: number;
+  lastObservedAt: string | null;
+  agents: UsageAgent[];
+  projects: Array<{
+    projectRef: string | null;
+    projectLabel: string;
+  }>;
+};
+
+export type UsageTopAgent = {
+  agent: UsageAgent;
+  observedUses: number;
+  activeSkills: number;
+  activeProjects: number;
+  lastObservedAt: string | null;
+};
+
+export type UsageSkillSeriesValue = {
+  key: string;
+  skillRef: SkillLeafId | null;
+  skillLabel: string;
+  observedUses: number;
+};
+
+export type UsageAgentSeriesValue = {
+  agent: UsageAgent;
+  observedUses: number;
+};
+
+export type UsageSkillAgentSeriesValue = {
+  skillKey: string;
+  agent: UsageAgent;
+  observedUses: number;
+};
+
+export type UsageTimeBucket = {
+  key: string;
+  label: string;
+  startAt: string;
+  endAt: string;
+  observedUses: number;
+  bySkill: UsageSkillSeriesValue[];
+  byAgent: UsageAgentSeriesValue[];
+  bySkillAgent: UsageSkillAgentSeriesValue[];
+};
+
+export type UsageHourlyActivityBucket = {
+  weekday: number;
+  hour: number;
+  observedUses: number;
+};
+
+export type UsageSkillAgentMatrixEntry = {
+  skillKey: string;
+  skillRef: SkillLeafId | null;
+  skillLabel: string;
+  agent: UsageAgent;
+  observedUses: number;
+};
+
+export type UsageProjectBreakdown = {
+  projectRef: string | null;
+  projectLabel: string;
+  observedUses: number;
+  inferredSignals: number;
+  activeSkills: number;
+  activeAgents: number;
+  lastObservedAt: string | null;
+};
+
+export type UsageRecentObservation = {
+  observedAt: string;
+  agent: UsageAgent;
+  skillRef: SkillLeafId | null;
+  skillLabel: string;
+  projectRef: string | null;
+  projectLabel: string;
+  evidenceKind: UsageEvidenceKind;
+  confidence: UsageConfidence;
+  outcome: UsageOutcome;
+  sourceKind: UsageSourceKind;
+};
+
+export type UsageSnapshotTruncation = {
+  topSkillsTruncated: boolean;
+  topAgentsTruncated: boolean;
+  chartSkillsTruncated: boolean;
+  projectsTruncated: boolean;
+  matrixTruncated: boolean;
+  recentObservationsTruncated: boolean;
+};
+
+export type UsageSnapshot = {
+  schemaVersion: 1;
+  generatedAt: string;
+  range: {
+    from: string;
+    to: string;
+    coverageFrom: string | null;
+    coverageTo: string | null;
+    startAt: string;
+    endAt: string;
+    preset: UsageRangePreset;
+  };
+  appliedFilters: {
+    agents: UsageAgent[];
+    skillRefs: SkillLeafId[];
+    projectRefs: string[];
+    confidence: UsageConfidence[];
+    includeInferred: boolean;
+  };
+  kpis: UsageKpis;
+  dailySeries: UsageDailyBucket[];
+  topSkills: UsageTopSkill[];
+  topAgents: UsageTopAgent[];
+  timeBuckets: UsageTimeBucket[];
+  hourlyActivity: UsageHourlyActivityBucket[];
+  skillAgentMatrix: UsageSkillAgentMatrixEntry[];
+  projectBreakdown: UsageProjectBreakdown[];
+  agentCoverage: UsageAgentCoverage[];
+  recentObservations: UsageRecentObservation[];
+  diagnostics: UsageDiagnostic[];
+  truncation: UsageSnapshotTruncation;
+};
+
 export type ScopedSourceDrafts = Record<string, Record<string, DraftBinding>>;
 
 export type CollectionSkillRef = {

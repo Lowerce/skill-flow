@@ -213,6 +213,161 @@ describe.sequential("bridge command dispatcher", () => {
     });
   });
 
+  test("refresh-usage forwards manual trigger and returns value envelope", async () => {
+    const app = {
+      refreshUsageObservations: vi.fn(async () => ({
+        schemaVersion: 1,
+        refreshedAt: "2026-08-23T00:00:00.000Z",
+        trigger: "manual",
+        status: "completed",
+        budget: {
+          globalBudgetMs: 30000,
+          perSourceBudgetMs: 5000,
+          maxFiles: 500,
+          maxBytes: 536870912,
+          cooldownSeconds: 900,
+        },
+        totals: {
+          sourcesFound: 1,
+          sourcesScanned: 1,
+          observedAccepted: 1,
+          inferredAccepted: 0,
+          duplicateSkipped: 0,
+          droppedInvalid: 0,
+          diagnosticsCount: 0,
+        },
+        coverage: [],
+        diagnostics: [],
+      })),
+    } as unknown as SkillFlowApp;
+
+    const response = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "refresh-usage",
+      payload: { trigger: "manual" },
+    });
+
+    expect(app.refreshUsageObservations).toHaveBeenCalledWith({ trigger: "manual" });
+    expect(response.ok).toBe(true);
+    expect(response.data).toHaveProperty("schemaVersion", 1);
+  });
+
+  test("usage-snapshot forwards sanitized filters", async () => {
+    const app = {
+      getUsageSnapshot: vi.fn(async () => ({
+        schemaVersion: 1,
+        generatedAt: "2026-08-23T00:00:00.000Z",
+        range: {
+          from: "2026-08-17",
+          to: "2026-08-23",
+          coverageFrom: null,
+          coverageTo: null,
+          preset: "7d",
+        },
+        appliedFilters: {
+          agents: ["claude-code", "zcode"],
+          skillRefs: [],
+          projectRefs: [],
+          confidence: ["observed"],
+          includeInferred: false,
+        },
+        kpis: {
+          observedUses: 0,
+          activeSkills: 0,
+          activeAgents: 0,
+          activeProjects: 0,
+          lastObservedAt: null,
+          inferredSignals: 0,
+        },
+        dailySeries: [],
+        topSkills: [],
+        projectBreakdown: [],
+        agentCoverage: [],
+        recentObservations: [],
+        diagnostics: [],
+        truncation: {
+          topSkillsTruncated: false,
+          chartSkillsTruncated: false,
+          projectsTruncated: false,
+          recentObservationsTruncated: false,
+        },
+      })),
+    } as unknown as SkillFlowApp;
+
+    const response = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "usage-snapshot",
+      payload: {
+        range: { preset: "7d" },
+        filters: { agents: ["claude-code", "zcode"], confidence: ["observed"], includeInferred: false },
+        limits: { topSkills: 10, topAgents: 10, chartSkills: 100, projects: 10, matrixEntries: 100, recentObservations: 20 },
+      },
+    });
+
+    expect(app.getUsageSnapshot).toHaveBeenCalledWith({
+      range: { preset: "7d" },
+      filters: { agents: ["claude-code", "zcode"], confidence: ["observed"], includeInferred: false },
+      limits: { topSkills: 10, topAgents: 10, chartSkills: 100, projects: 10, matrixEntries: 100, recentObservations: 20 },
+    });
+    expect(response.ok).toBe(true);
+  });
+
+  test("rejects invalid usage-snapshot filters", async () => {
+    const app = new SkillFlowApp();
+    const response = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "usage-snapshot",
+      payload: {
+        filters: { agents: ["unsupported-agent"] },
+      },
+    });
+
+    expect(response.ok).toBe(false);
+    expect(response.errors[0]?.code).toBe("BRIDGE_REQUEST_INVALID");
+  });
+
+  test.each(["today", "24h", "7d", "30d", "90d", "available"] as const)(
+    "accepts usage range preset %s",
+    async (preset) => {
+      const app = {
+        getUsageSnapshot: vi.fn(async () => ({ ok: true, data: { range: { preset } }, warnings: [], errors: [] })),
+      } as unknown as SkillFlowApp;
+
+      const response = await executeBridgeRequest(app, {
+        protocolVersion: PROTOCOL_VERSION,
+        command: "usage-snapshot",
+        payload: { range: { preset } },
+      });
+
+      expect(response.ok).toBe(true);
+      expect(app.getUsageSnapshot).toHaveBeenCalledWith({ range: { preset } });
+    },
+  );
+
+  test("accepts custom usage range and rejects incomplete endpoints", async () => {
+    const app = {
+      getUsageSnapshot: vi.fn(async () => ({ ok: true, data: {}, warnings: [], errors: [] })),
+    } as unknown as SkillFlowApp;
+
+    const valid = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "usage-snapshot",
+      payload: { range: { preset: "custom", from: "2026-08-01", to: "2026-08-24" } },
+    });
+    expect(valid.ok).toBe(true);
+    expect(app.getUsageSnapshot).toHaveBeenCalledWith({
+      range: { preset: "custom", from: "2026-08-01", to: "2026-08-24" },
+    });
+
+    const invalid = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "usage-snapshot",
+      payload: { range: { preset: "custom", from: "2026-08-01" } },
+    });
+    expect(invalid.ok).toBe(false);
+    expect(invalid.errors[0]?.code).toBe("BRIDGE_REQUEST_INVALID");
+  });
+
   test("rejects invalid apply payload", async () => {
     const app = new SkillFlowApp();
     const response = await executeBridgeRequest(app, {

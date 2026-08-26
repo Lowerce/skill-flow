@@ -45,6 +45,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     enum Page: Equatable {
         case home
         case importPage
+        case usage
         case settings
         case detail(sourceId: String)
     }
@@ -151,6 +152,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     private let detailDocumentStore = DetailDocumentStore()
     let bridgeClient: BridgeClient
     private let detailEnrichmentQuery: any DesktopDetailEnrichmentQuerying
+    private let usageQuery: any DesktopUsageQuerying
 
     @ObservationIgnored weak var routeState: DesktopAppState?
 
@@ -175,6 +177,8 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     private var detectedTargets: Set<String> = []
     var inspectedPayloadBySourceId: [ScopedSourceKey: [String: Any]] = [:]
     private var detailEnrichmentPayloadBySourceId: [String: [String: Any]] = [:]
+    var usageSnapshot: UsageSnapshotViewData?
+    var usageLoadState: LoadState = .idle
     var renamedSourceDisplayNameOverridesBySourceId: [String: String] = [:]
     var renamedSourceOriginalDisplayNameOverridesBySourceId: [String: String] = [:]
     private var preparedDetailContentBySourceId: [String: DetailLogic.PreparedDetailContent] = [:]
@@ -290,6 +294,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         self.taskCoordinator = TaskCoordinator()
         self.bridgeClient = bridgeClient
         self.detailEnrichmentQuery = resolvedQueryFacade
+        self.usageQuery = resolvedQueryFacade
         self.settingsStore = settingsStore
         self.sourceManagement = SourceManagement(
             bridgeClient: bridgeClient,
@@ -1379,8 +1384,46 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         switch page {
         case .home: return .home
         case .importPage: return .importPage
+        case .usage: return .usage
         case .settings: return .settings
         case .detail(let sourceId): return .detail(sourceId: sourceId)
+        }
+    }
+
+    func loadUsageSnapshot(
+        force: Bool = false,
+        rangePreset: String = "30d",
+        from: String? = nil,
+        to: String? = nil
+    ) async {
+        guard force || usageSnapshot?.rangePreset.rawValue != rangePreset else { return }
+        usageLoadState = .loading
+        do {
+            let response = try await usageQuery.usageSnapshot(rangePreset: rangePreset, from: from, to: to)
+            guard response.ok,
+                  let snapshot = BridgePayloadDecoder.usageSnapshot(from: response.data?.value as? [String: Any])
+            else {
+                usageLoadState = .failed(response.errors.first?.message ?? "Unable to load usage analytics.")
+                return
+            }
+            usageSnapshot = snapshot
+            usageLoadState = .ready
+        } catch {
+            usageLoadState = .failed(error.localizedDescription)
+        }
+    }
+
+    func refreshUsageAnalytics() async {
+        usageLoadState = .loading
+        do {
+            let response = try await usageQuery.refreshUsage(trigger: "manual")
+            guard response.ok else {
+                usageLoadState = .failed(response.errors.first?.message ?? "Unable to refresh usage analytics.")
+                return
+            }
+            await loadUsageSnapshot(force: true, rangePreset: "30d")
+        } catch {
+            usageLoadState = .failed(error.localizedDescription)
         }
     }
 

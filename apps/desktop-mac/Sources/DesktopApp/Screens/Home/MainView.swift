@@ -136,6 +136,7 @@ struct MainView: View {
         let showHome: () -> Void
         let showDetail: (String) -> Void
         let showImportPage: () -> Void
+        let showUsage: () -> Void
         let showSettings: () -> Void
     }
 
@@ -365,6 +366,10 @@ struct MainView: View {
                 Task {
                     await viewModel.loadImportPageIfNeeded()
                 }
+            case .usage:
+                Task {
+                    await viewModel.loadUsageSnapshot()
+                }
             default:
                 break
             }
@@ -420,6 +425,7 @@ struct MainView: View {
                     HStack(spacing: 8) {
                         searchField
                         importButton
+                        usageButton
                         groupEditorButton
                         homeUpdateButton
                         settingsButton
@@ -435,6 +441,7 @@ struct MainView: View {
                     searchField
                     Spacer(minLength: 0)
                     importButton
+                    usageButton
                     groupEditorButton
                     homeUpdateButton
                     settingsButton
@@ -470,6 +477,18 @@ struct MainView: View {
                         .frame(width: Self.headerLeadingWidth, alignment: .leading)
                     Spacer(minLength: 0)
                     settingsHeaderActions
+                    settingsButton
+                }
+                .padding(.leading, Self.nonHomeHeaderLeadingPadding)
+                .padding(.trailing, Self.nonHomeHeaderTrailingPadding)
+                .frame(height: 52)
+                .background(AppTheme.headerBackground(for: theme))
+            } else if isUsagePage {
+                HStack(spacing: 10) {
+                    topBarTitleRow
+                        .frame(width: Self.headerLeadingWidth, alignment: .leading)
+                    Spacer(minLength: 0)
+                    usageRefreshButton
                     settingsButton
                 }
                 .padding(.leading, Self.nonHomeHeaderLeadingPadding)
@@ -522,6 +541,10 @@ struct MainView: View {
 
     private var isSettingsPage: Bool {
         homeViewModel.currentRoute == .settings
+    }
+
+    private var isUsagePage: Bool {
+        homeViewModel.currentRoute == .usage
     }
 
     private var headerLogoRow: some View {
@@ -697,6 +720,10 @@ struct MainView: View {
         toolbarIconButton(.import) { navigation.showImportPage() }
     }
 
+    private var usageButton: some View {
+        toolbarIconButton(.usage) { navigation.showUsage() }
+    }
+
     private func importHeaderActions(forWindowWidth width: CGFloat) -> some View {
         HStack(spacing: Self.importHeaderItemSpacing(forWindowWidth: width)) {
             importModeButton(.recommended, titleKey: "import.mode.recommended", icon: .importRecommended)
@@ -857,6 +884,30 @@ struct MainView: View {
 
     private var settingsButton: some View {
         toolbarIconButton(.settings) { navigation.showSettings() }
+    }
+
+    private var usageRefreshButton: some View {
+        Button {
+            Task { await viewModel.refreshUsageAnalytics() }
+        } label: {
+            HStack(spacing: 7) {
+                actionIcon(.update, size: 13)
+                Text("Refresh")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(AppTheme.textPrimary(for: theme))
+            .padding(.horizontal, 11)
+            .frame(height: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .desktopMotionButton(kind: .primary, theme: theme, accent: accent, isEnabled: true)
+        .background(AppTheme.headerControlFill(for: theme))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppTheme.cardBorder(for: theme), lineWidth: 0.5)
+        }
     }
 
     private var settingsHeaderActions: some View {
@@ -1051,6 +1102,12 @@ struct MainView: View {
                 theme: theme,
                 accent: accent
             )
+        case .usage:
+            UsageScreen(
+                viewModel: viewModel,
+                theme: theme,
+                accent: accent
+            )
         case .settings:
             SettingsScreen(
                 viewModel: settingsViewModel,
@@ -1132,6 +1189,7 @@ struct MainView: View {
             homeSearchField(width: searchWidth)
             Spacer(minLength: 0)
             importButton
+            usageButton
             groupEditorButton
             homeUpdateButton
             settingsButton
@@ -1309,6 +1367,8 @@ struct MainView: View {
             return t("page.home.title")
         case .importPage:
             return t("page.import.title")
+        case .usage:
+            return "Usage"
         case .settings:
             return t("page.settings.title")
         case .detail:
@@ -1320,14 +1380,14 @@ struct MainView: View {
         switch route {
         case .home, .importPage:
             return true
-        case .settings, .detail:
+        case .usage, .settings, .detail:
             return false
         }
     }
 
     static func shouldAutofocusSearchField(for route: DesktopRoute) -> Bool {
         switch route {
-        case .home, .importPage, .settings, .detail:
+        case .home, .importPage, .usage, .settings, .detail:
             return false
         }
     }
@@ -1510,6 +1570,7 @@ struct MainView: View {
                     homeContainer.setSelectedHomeAgentFilter(optionId == "all" ? nil : optionId)
                 }
 
+                homeSidebarUsageEntry
                 homeSidebarProjectSection
             }
             .padding(.horizontal, Self.homeSidebarHorizontalPadding)
@@ -1541,6 +1602,36 @@ struct MainView: View {
         .padding(.horizontal, Self.homeSidebarHorizontalPadding)
         .padding(.top, Self.homeTitlebarControlTopPadding)
         .frame(height: Self.homeSidebarHeaderHeight, alignment: .top)
+    }
+
+    private var homeSidebarUsageEntry: some View {
+        Button {
+            navigation.showUsage()
+        } label: {
+            HStack(alignment: .center, spacing: 8) {
+                actionIcon(.usage, size: 13)
+                    .foregroundStyle(AppTheme.brand(for: accent, in: theme))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Usage Analytics")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppTheme.textPrimary(for: theme))
+                    Text("Skill calls by agent and project")
+                        .font(.system(size: 10, weight: .regular))
+                        .foregroundStyle(AppTheme.textMuted(for: theme))
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(AppTheme.textMuted(for: theme))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .desktopMotionChip(kind: .pill, theme: theme, accent: accent, isEnabled: true, isSelected: false)
+        .accessibilityLabel("Usage Analytics")
     }
 
     private var homeSidebarToggleButton: some View {
@@ -2011,6 +2102,26 @@ struct MainView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(AppTheme.cardBorder(for: theme), lineWidth: 0.5)
         }
+        .accessibilityLabel(toolbarIconLabel(icon))
+    }
+
+    private func toolbarIconLabel(_ icon: ActionIcon) -> String {
+        switch icon {
+        case .back:
+            return "Back"
+        case .groupEditor:
+            return "Group Editor"
+        case .import:
+            return "Import"
+        case .settings:
+            return "Settings"
+        case .update:
+            return "Refresh"
+        case .usage:
+            return "Usage"
+        default:
+            return icon.rawValue
+        }
     }
 
     @ViewBuilder
@@ -2177,9 +2288,9 @@ extension MainView {
         includesSidebarToggle: Bool
     ) -> CGFloat {
         let toggleWidth = includesSidebarToggle ? homeSidebarToggleButtonSize : 0
-        let spacingCount: CGFloat = includesSidebarToggle ? 7 : 6
+        let spacingCount: CGFloat = includesSidebarToggle ? 8 : 7
         let itemSpacing = homeMainHeaderItemSpacing(includesSidebarToggle: includesSidebarToggle)
-        return (toolbarButtonSize * 4)
+        return (toolbarButtonSize * 5)
             + toggleWidth
             + homeMainHeaderBrandWidth
             + reservedHorizontalPadding

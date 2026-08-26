@@ -22,6 +22,58 @@ _Avoid_: App Group container (unless later required), preferences.json for these
 Authoritative skill-flow state under `~/.skillflow` (manifest, lock, preferences, sources). Shared across CLI, TUI, and desktop bridge. Distinct from Desktop Workspace Memory unless a later decision elevates specific fields into it.
 _Avoid_: UserDefaults, desktop-only store
 
+### AI assistance
+
+**Model Provider**:
+An external or local model service selected to perform Skill-derived AI work such as tag suggestions and document translation. It is distinct from providers that locate or describe import sources.
+_Avoid_: AI provider (ambiguous), import provider, source provider
+
+### Skill usage analytics
+
+**Skill Usage Observation**:
+A local, explainable record that an Agent explicitly activated, selected, invoked by name, or invoked through a named tool a Skill. It carries the Agent, evidence source, confidence, and optional observed terminal state; it does not imply business success.
+_Avoid_: install count, deployment status, inferred file read, skill success
+
+**Lifecycle Event**:
+A local record of a Skill management operation such as install, update, sync, deployment, or removal. It is distinct from a Skill Usage Observation and is never included in usage counts.
+_Avoid_: usage, activation, invocation
+
+**Automatic Local Collection**:
+Skill Flow automatically reads known local session or event roots for detected Agent targets and derives minimal Skill Usage Observations without a user confirmation, directory picker, remote connection, or write-back to the Agent. Missing sources, read failures, and parser drift lower coverage rather than triggering a collection gate.
+_Avoid_: opt-in connector, manual import, consent flow, remote telemetry
+
+**Usage Retention**:
+The automatic lifecycle for Skill Usage Observations: raw observations remain for 90 days within fixed record and disk caps, while daily aggregates remain for 365 days. It is isolated from management audit history and never deletes Agent session data.
+_Avoid_: audit rotation, source cleanup, Agent session cleanup
+
+**Skill Run**:
+A user-facing count of Skill Usage Observations in the selected Usage Snapshot range. Each observation counts once; this metric is never de-duplicated.
+_Avoid_: distinct Skill count, install count
+
+**Usage Snapshot**:
+The bridge-facing, dashboard-ready aggregation produced from one filtered set of local Skill Usage Observations. It owns KPIs, time buckets, rankings, the Skill-Agent Matrix, hourly activity, coverage diagnostics, and bounded recent records.
+_Avoid_: raw Agent transcript, lifecycle audit
+
+**Usage Time Bucket**:
+A local-time hour or calendar-day interval used by the Usage chart. Each bucket carries raw per-series counts; series are rendered separately rather than stacked.
+_Avoid_: UTC-only bucket, stacked total
+
+**Skill-Agent Matrix**:
+The Usage Snapshot relation that counts Skill Runs by normalized Skill identity and Agent. It is the source for click-through views that split one Skill by Agent or one Agent by Skill.
+_Avoid_: Agent Coverage, generic tool-call matrix
+
+**Top Agent**:
+An Agent ranked by Skill Run count in the selected Usage Snapshot range. It is a usage analytic and must not be inferred from Agent Coverage status.
+_Avoid_: coverage rank, supported-agent list
+
+**Hourly Activity**:
+The local-time weekday × hour aggregation used by the Usage page's 分时活跃 heatmap. It is calculated from the same filtered observations as the other Usage Snapshot metrics.
+_Avoid_: process uptime, session duration
+
+**Agent Coverage**:
+Collection-health metadata describing whether an Agent source was found, scanned, readable, and parsed. Coverage does not contribute to Top Agent counts and an unsupported source is not a zero-use result.
+_Avoid_: Top Agent, usage total
+
 ### Agent presentation (desktop)
 
 **Agent Display Visibility**:

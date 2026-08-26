@@ -8,8 +8,19 @@ import {
   type JsonObject,
   type JsonValue,
 } from "@skill-flow/shared-types/protocol";
-import type { DraftBinding, ImportDraft, ProjectScope } from "@skill-flow/domain/types";
-import type { SkillFlowApp } from "@skill-flow/query/runtime";
+import {
+  USAGE_AGENTS,
+  type DraftBinding,
+  type ImportDraft,
+  type ProjectScope,
+  type UsageAgent,
+  type UsageConfidence,
+  type UsageRefreshTrigger,
+  type UsageSnapshotFilters,
+} from "@skill-flow/domain/types";
+import type {
+  SkillFlowApp,
+} from "@skill-flow/query/runtime";
 
 type BridgeFailure = {
   code: string;
@@ -255,6 +266,17 @@ const bridgeCommandHandlers = {
       throw new Error("Bridge command 'external-update' requires confirmExternalUpdate: true.");
     }
     return runBridgeResult(request, () => app.updateExternalSource(sourceId));
+  },
+  "refresh-usage": async (app, request) => {
+    const payload = expectOptionalObject(request.payload, "refresh-usage");
+    const trigger = expectOptionalUsageRefreshTrigger(payload?.trigger);
+    return runBridgeValue(request, () => app.refreshUsageObservations({
+      trigger: trigger ?? "scheduled",
+    }));
+  },
+  "usage-snapshot": async (app, request) => {
+    const payload = expectOptionalObject(request.payload, "usage-snapshot");
+    return runBridgeValue(request, () => app.getUsageSnapshot(parseUsageSnapshotFilters(payload)));
   },
   add: async (app, request) => {
     const payload = expectObjectPayload(request.payload, "add");
@@ -614,6 +636,130 @@ function expectProjectScope(value: JsonValue | undefined): ProjectScope {
   }
 
   throw new Error("Field 'scope.kind' must be either 'global' or 'project'.");
+}
+
+function expectOptionalUsageRefreshTrigger(value: JsonValue | undefined): UsageRefreshTrigger | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "bootstrap" && value !== "scheduled" && value !== "manual") {
+    throw new Error("Field 'trigger' must be 'bootstrap', 'scheduled', or 'manual'.");
+  }
+  return value;
+}
+
+function parseUsageSnapshotFilters(payload: JsonObject | undefined): UsageSnapshotFilters {
+  if (!payload) {
+    return {};
+  }
+  const range = payload.range === undefined ? undefined : parseUsageRange(payload.range);
+  const filters = payload.filters === undefined ? undefined : parseUsageFilters(payload.filters);
+  const limits = payload.limits === undefined ? undefined : parseUsageLimits(payload.limits);
+  return {
+    ...(range ? { range } : {}),
+    ...(filters ? { filters } : {}),
+    ...(limits ? { limits } : {}),
+  };
+}
+
+function parseUsageRange(value: JsonValue | undefined): NonNullable<UsageSnapshotFilters["range"]> {
+  if (!isJsonObject(value)) {
+    throw new Error("Field 'range' must be an object when provided.");
+  }
+  const preset = value.preset;
+  if (
+    preset !== undefined &&
+    preset !== "today" &&
+    preset !== "24h" &&
+    preset !== "7d" &&
+    preset !== "30d" &&
+    preset !== "90d" &&
+    preset !== "available" &&
+    preset !== "custom"
+  ) {
+    throw new Error("Field 'range.preset' must be 'today', '24h', '7d', '30d', '90d', 'available', or 'custom'.");
+  }
+  const from = expectOptionalString(value.from, "range.from", "usage-snapshot");
+  const to = expectOptionalString(value.to, "range.to", "usage-snapshot");
+  if ((preset === "custom" || from !== undefined || to !== undefined) && (!from || !to)) {
+    throw new Error("Fields 'range.from' and 'range.to' must be provided together for a custom usage range.");
+  }
+  return {
+    ...(preset ? { preset } : {}),
+    ...(from !== undefined ? { from } : {}),
+    ...(to !== undefined ? { to } : {}),
+  };
+}
+
+function parseUsageFilters(value: JsonValue | undefined): NonNullable<UsageSnapshotFilters["filters"]> {
+  if (!isJsonObject(value)) {
+    throw new Error("Field 'filters' must be an object when provided.");
+  }
+  const agents = parseOptionalUsageAgents(value.agents);
+  const skillRefs = parseOptionalStringArray(value.skillRefs, "filters.skillRefs");
+  const projectRefs = parseOptionalStringArray(value.projectRefs, "filters.projectRefs");
+  const confidence = parseOptionalUsageConfidence(value.confidence);
+  const includeInferred = expectOptionalBoolean(value.includeInferred, "filters.includeInferred", "usage-snapshot");
+  return {
+    ...(agents ? { agents } : {}),
+    ...(skillRefs ? { skillRefs } : {}),
+    ...(projectRefs ? { projectRefs } : {}),
+    ...(confidence ? { confidence } : {}),
+    ...(includeInferred !== undefined ? { includeInferred } : {}),
+  };
+}
+
+function parseOptionalUsageAgents(value: JsonValue | undefined): UsageAgent[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const agents = parseOptionalStringArray(value, "filters.agents");
+  const allowed = new Set<UsageAgent>(USAGE_AGENTS);
+  if (!agents?.every((agent): agent is UsageAgent => allowed.has(agent as UsageAgent))) {
+    throw new Error("Field 'filters.agents' contains an unsupported usage agent.");
+  }
+  return agents;
+}
+
+function parseOptionalUsageConfidence(value: JsonValue | undefined): UsageConfidence[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const confidence = parseOptionalStringArray(value, "filters.confidence");
+  if (!confidence?.every((item): item is UsageConfidence => item === "observed" || item === "inferred")) {
+    throw new Error("Field 'filters.confidence' must contain only 'observed' or 'inferred'.");
+  }
+  return confidence;
+}
+
+function parseUsageLimits(value: JsonValue | undefined): NonNullable<UsageSnapshotFilters["limits"]> {
+  if (!isJsonObject(value)) {
+    throw new Error("Field 'limits' must be an object when provided.");
+  }
+  const topSkills = expectOptionalSafeInteger(value.topSkills, "limits.topSkills");
+  const topAgents = expectOptionalSafeInteger(value.topAgents, "limits.topAgents");
+  const chartSkills = expectOptionalSafeInteger(value.chartSkills, "limits.chartSkills");
+  const projects = expectOptionalSafeInteger(value.projects, "limits.projects");
+  const matrixEntries = expectOptionalSafeInteger(value.matrixEntries, "limits.matrixEntries");
+  const recentObservations = expectOptionalSafeInteger(value.recentObservations, "limits.recentObservations");
+  return {
+    ...(topSkills !== undefined ? { topSkills } : {}),
+    ...(topAgents !== undefined ? { topAgents } : {}),
+    ...(chartSkills !== undefined ? { chartSkills } : {}),
+    ...(projects !== undefined ? { projects } : {}),
+    ...(matrixEntries !== undefined ? { matrixEntries } : {}),
+    ...(recentObservations !== undefined ? { recentObservations } : {}),
+  };
+}
+
+function expectOptionalSafeInteger(value: JsonValue | undefined, field: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Field '${field}' must be a non-negative safe integer when provided.`);
+  }
+  return value;
 }
 
 function sanitizeForJson<T>(value: T): JsonValue {
