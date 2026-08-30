@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import XCTest
 
 @testable import SkillFlowDesktop
@@ -78,6 +79,23 @@ final class MainViewModelSelectionTests: XCTestCase {
         XCTAssertEqual(model.skillSelectionState(sourceId: "alpha"), .partial)
         XCTAssertFalse(model.isSkillEnabled("alpha-a", sourceId: "alpha"))
         XCTAssertTrue(model.isSkillEnabled("alpha-b", sourceId: "alpha"))
+    }
+
+    func testBootstrapSchedulesUsageRefreshAfterTheWorkspaceBecomesReady() async throws {
+        let fixture = try TestFixture.install()
+        try fixture.reset(state: .baseline)
+        let appState = DesktopAppState()
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        model.bindRouteState(appState)
+
+        await model.bootstrap()
+
+        guard case .ready = model.loadState else {
+            return XCTFail("Expected workspace to become ready before background usage refresh")
+        }
+        try await fixture.waitForLoggedRequest(command: "refresh-usage")
+        let refreshRequest = fixture.loggedRequests().last { $0.command == "refresh-usage" }
+        XCTAssertEqual(refreshRequest?.payload?["trigger"]?.value as? String, "bootstrap")
     }
 
     func testHomeStatusAndSourceFilterDefaultsAreAvailable() async throws {
@@ -980,7 +998,7 @@ final class MainViewModelSelectionTests: XCTestCase {
         XCTAssertEqual(model.detailSnapshot(for: "alpha")?.enabledTargetLabels, ["Cursor"])
     }
 
-    func testTargetToggleKeepsLoadingVisibleForMinimumDuration() async throws {
+    func testTargetToggleDoesNotAddArtificialLoadingDelay() async throws {
         let fixture = try TestFixture.install()
         try fixture.reset(state: .baseline)
 
@@ -995,7 +1013,7 @@ final class MainViewModelSelectionTests: XCTestCase {
         )
 
         let elapsed = startedAt.duration(to: ContinuousClock.now)
-        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(200))
+        XCTAssertLessThan(elapsed, .milliseconds(150))
         XCTAssertEqual(model.saveState(for: "alpha").phase, .saved)
     }
 
@@ -1148,6 +1166,60 @@ final class MainViewModelSelectionTests: XCTestCase {
         await model.renameSource(sourceId: "alpha", displayName: "Writing Tools")
 
         XCTAssertEqual(model.detailSnapshot(for: "alpha")?.title, "Writing Tools")
+    }
+
+    func testHomeEnrichmentPrefetchIsReusedWhenOpeningDetail() async throws {
+        let fixture = try TestFixture.install()
+        try fixture.reset(state: .baseline)
+        let state = DesktopAppState()
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        model.bindRouteState(state)
+        await model.bootstrap()
+
+        await model.prefetchHomeGroupCardMetadataIfNeeded(["alpha"])
+        try await fixture.waitForLoggedRequest(command: "inspect-enrichment", sourceId: "alpha")
+        await model.selectSource("alpha")
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        let enrichmentRequests = fixture.loggedRequests().filter {
+            $0.command == "inspect-enrichment"
+                && $0.payload?["sourceId"]?.value as? String == "alpha"
+        }
+        XCTAssertEqual(enrichmentRequests.count, 1)
+    }
+
+    func testHomeEnrichmentPrefetchDoesNotWarmDetailContent() async throws {
+        let fixture = try TestFixture.install()
+        try fixture.reset(state: .baseline)
+        let state = DesktopAppState()
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        model.bindRouteState(state)
+        await model.bootstrap()
+
+        await model.prefetchHomeGroupCardMetadataIfNeeded(["alpha"])
+        try await fixture.waitForLoggedRequest(command: "inspect-enrichment", sourceId: "alpha")
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertFalse(model.hasPreparedOrScheduledDetailContent(for: "alpha"))
+    }
+
+    func testDetailRenderWaitsForInFlightEnrichmentBeforeWarmup() async throws {
+        let fixture = try TestFixture.install()
+        var fixtureState = TestFixture.State.baseline
+        fixtureState.inspectEnrichmentDelayMilliseconds = 400
+        try fixture.reset(state: fixtureState)
+        let state = DesktopAppState()
+        state.view.currentRoute = .detail(sourceId: "alpha")
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        model.bindRouteState(state)
+        model.detailWarmupDelay = .zero
+        await model.bootstrap()
+
+        await model.selectSource("alpha")
+        _ = model.detailSnapshot(for: "alpha")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(model.hasPreparedOrScheduledDetailContent(for: "alpha"))
     }
 
     func testRenameSourceKeepsDetailTitleWhenInFlightEnrichmentReturnsOldSnapshot() async throws {
@@ -1773,6 +1845,30 @@ final class MainViewModelSelectionTests: XCTestCase {
         }
 
         XCTAssertTrue(model.detailSnapshot(for: "alpha")?.skills.allSatisfy({ !$0.documents.isEmpty }) == true)
+    }
+
+    func testDetailWarmupCompletionInvalidatesObservedSnapshot() async throws {
+        let fixture = try TestFixture.install()
+        try fixture.reset(state: .baseline)
+        let state = DesktopAppState()
+        state.view.currentRoute = .detail(sourceId: "alpha")
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        model.bindRouteState(state)
+        model.detailWarmupDelay = .milliseconds(300)
+        await model.bootstrap()
+        await model.selectSource("alpha")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let invalidated = ThreadSafeFlag()
+        withObservationTracking {
+            _ = model.detailSnapshot(for: "alpha")
+        } onChange: {
+            invalidated.setTrue()
+        }
+
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertTrue(invalidated.value)
     }
 
     func testHydratedSkillDocumentTabsRemainUnloadedUntilOpened() async throws {

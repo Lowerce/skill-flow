@@ -137,7 +137,7 @@ final class ImportScreenContainerTests: XCTestCase {
 
         for (locator, expected) in cases {
             XCTAssertEqual(
-                MainViewModel.isSupportedImportLocator(locator),
+                ImportLocatorParser.isSupported(locator),
                 expected,
                 "locator: \(locator)"
             )
@@ -1214,7 +1214,7 @@ final class ImportScreenContainerTests: XCTestCase {
         ])
     }
 
-    func testChangedLocalChoiceFallsBackToFirstChoiceAndKeepsImportEnabled() {
+    func testLocalChoiceFallsBackToFirstChoiceAndKeepsImportEnabled() {
         let state = DesktopAppState()
         let model = MainViewModel(bridgeClient: BridgeClient())
         let container = ImportScreenContainer(state: state, mainViewModel: model)
@@ -1234,7 +1234,7 @@ final class ImportScreenContainerTests: XCTestCase {
                 .init(id: "writer", title: "Writer", summary: "", selectedByDefault: true),
             ],
             targets: [],
-            localValidationStatus: "changed",
+            localValidationStatus: "local-only",
             selectedLocalChoiceId: nil,
             localChoices: [
                 LocalImportChoice(
@@ -1296,6 +1296,26 @@ final class ImportScreenContainerTests: XCTestCase {
         XCTAssertEqual(searched?.searchPhase, .loading)
         XCTAssertEqual(searched?.content.map(\.id), ["search"])
         XCTAssertEqual(searched?.importingGroupId, "search")
+    }
+
+    func testSnapshotReusesRecommendationsLoadedAtContainerInitialization() {
+        let state = DesktopAppState()
+        let model = MainViewModel(bridgeClient: BridgeClient())
+        var providerCallCount = 0
+        let container = ImportScreenContainer(
+            state: state,
+            mainViewModel: model,
+            recommendationsProvider: {
+                providerCallCount += 1
+                return []
+            }
+        )
+        state.view.currentRoute = .importPage
+
+        _ = container.snapshot(locale: Locale(identifier: "en"))
+        _ = container.snapshot(locale: Locale(identifier: "zh-Hans"))
+
+        XCTAssertEqual(providerCallCount, 1)
     }
 
     func testImportPageModeSwitchesDisplayedGroups() {
@@ -1439,11 +1459,23 @@ final class ImportScreenContainerTests: XCTestCase {
             ),
         ]
 
-        XCTAssertEqual(ImportScreen.groupIDsNeedingSkillDetails(for: cards), ["remote-loading"])
-        XCTAssertEqual(
-            ImportScreen.skillDetailsPrefetchTaskKey(cards: cards, submittedQuery: "browse"),
-            "browse|remote-loading"
+        XCTAssertTrue(ImportScreen.needsSkillDetailsPrefetch(for: cards[0]))
+        XCTAssertFalse(ImportScreen.needsSkillDetailsPrefetch(for: cards[1]))
+        XCTAssertFalse(ImportScreen.needsSkillDetailsPrefetch(for: cards[2]))
+        XCTAssertNotEqual(
+            ImportScreen.skillDetailsPrefetchTaskKey(for: cards[0]),
+            ImportScreen.skillDetailsPrefetchTaskKey(for: cards[1])
         )
+    }
+
+    func testImportSkillDetailPrefetchIsScopedToLazyGridCards() throws {
+        let source = try String(
+            contentsOf: sourceRoot().appendingPathComponent("Sources/DesktopApp/Screens/Import/ImportScreen.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(source.contains("importCard(card, phase: importPhases[card.id])\n                        .task"))
+        XCTAssertFalse(source.contains("skillDetailsPrefetchTaskKey(cards:"))
     }
 
     func testImportHeaderUsesTwoModesAndOneLocalImportAction() throws {
@@ -1570,34 +1602,27 @@ final class ImportScreenContainerTests: XCTestCase {
         let state = DesktopAppState()
         state.view.currentRoute = .importPage
         let query = RecordingLocalImportQueryFacade()
-        query.localGroups = [
-            [
+        query.localScanPayloads = [[
+            "localScanGroups": [[
                 "id": "local-skills",
                 "title": "Local Skills",
-                "locator": "file:///Users/Vint/skills",
-                "canonicalRepo": "local-skills",
-                "provider": "local",
-                "localImport": [
-                    "validationStatus": "matched",
-                    "choices": [
-                        [
-                            "id": "local",
-                            "label": "Local",
-                            "locator": "file:///Users/Vint/skills",
-                            "selectedSkills": [
-                                [
-                                    "uiId": "browse",
-                                    "selector": [
-                                        "kind": "repoPath",
-                                        "path": "browse",
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ]
+                "status": "local-only",
+                "sourcePaths": [[
+                    "path": "/Users/Vint/skills",
+                    "kind": "manual",
+                    "contentHash": "hash-local-skills",
+                    "alreadyManaged": false,
+                ]],
+                "skills": [[
+                    "id": "browse",
+                    "title": "Browse",
+                    "status": "local-only",
+                    "selectionRequired": false,
+                    "variants": [],
+                ]],
+                "importChoices": [],
+            ]],
+        ]]
         let model = MainViewModel(
             bridgeClient: BridgeClient(),
             queryFacade: query
@@ -1624,11 +1649,10 @@ final class ImportScreenContainerTests: XCTestCase {
         let query = RecordingLocalImportQueryFacade()
         query.localScanPayloads = [
             [
-                "groups": [],
                 "localScanGroups": [
                     [
-                        "id": "paramchoudhary/resumeskills:skills/resume-review",
-                        "title": "Resume Skills",
+                        "id": "local:resume-review",
+                        "title": "Resume Review",
                         "status": "version-conflict",
                         "sourcePaths": [
                             [
@@ -1651,7 +1675,6 @@ final class ImportScreenContainerTests: XCTestCase {
                                 "title": "Resume Review",
                                 "status": "version-conflict",
                                 "selectionRequired": true,
-                                "originSkillId": "skills/resume-review",
                                 "variants": [
                                     [
                                         "id": "skills/resume-review:hash-codex",
@@ -1672,11 +1695,6 @@ final class ImportScreenContainerTests: XCTestCase {
                             ],
                         ],
                         "importChoices": [],
-                        "origin": [
-                            "canonicalRepo": "paramchoudhary/resumeskills",
-                            "locator": "https://github.com/paramchoudhary/resumeskills.git",
-                            "previewStatus": "ready",
-                        ],
                     ],
                 ],
             ],
@@ -1709,7 +1727,7 @@ final class ImportScreenContainerTests: XCTestCase {
         )
     }
 
-    func testImportLocalDirectoryDoesNotDuplicateAlreadyScannedPath() async {
+    func testImportLocalDirectoryIgnoresLegacyGroupsWhenLocalScanGroupsAreEmpty() async {
         let state = DesktopAppState()
         state.view.currentRoute = .importPage
         let query = RecordingLocalImportQueryFacade()
@@ -1737,7 +1755,7 @@ final class ImportScreenContainerTests: XCTestCase {
             ],
             "localScanGroups": [],
         ]
-        query.localScanPayloads = [payload, payload]
+        query.localScanPayloads = [payload]
         let model = MainViewModel(
             bridgeClient: BridgeClient(),
             queryFacade: query
@@ -1745,12 +1763,64 @@ final class ImportScreenContainerTests: XCTestCase {
         let container = ImportScreenContainer(state: state, mainViewModel: model)
 
         await container.importLocalDirectory("/Users/me/skills/writer")
+
+        XCTAssertTrue(model.localImportGroups.isEmpty)
+        XCTAssertEqual(query.scanPaths, ["/Users/me/skills/writer"])
+    }
+
+    func testImportLocalDirectoryParsesFinalLocalScanImportChoiceShape() async throws {
+        let state = DesktopAppState()
+        state.view.currentRoute = .importPage
+        let query = RecordingLocalImportQueryFacade()
+        query.localScanPayloads = [[
+            "localScanGroups": [[
+                "id": "local:writer",
+                "title": "Writer",
+                "status": "local-only",
+                "sourcePaths": [[
+                    "path": "/Users/me/skills/writer",
+                    "kind": "manual",
+                    "contentHash": "hash-writer",
+                    "alreadyManaged": false,
+                ]],
+                "skills": [[
+                    "id": "writer",
+                    "title": "Writer",
+                    "status": "local-only",
+                    "selectionRequired": false,
+                    "variants": [[
+                        "id": "writer:hash-writer",
+                        "path": "/Users/me/skills/writer",
+                        "contentHash": "hash-writer",
+                        "selectedByDefault": true,
+                        "importable": true,
+                    ]],
+                ]],
+                "importChoices": [[
+                    "scanId": "writer",
+                    "sourceChoiceId": "local",
+                    "rootPath": "/Users/me/skills/writer",
+                    "sourcePath": "/Users/me/skills/writer",
+                    "variant": "single-source",
+                    "detectedSkills": [],
+                    "selectedSkills": [[
+                        "uiId": "writer",
+                        "selector": ["kind": "repoPath", "path": "writer"],
+                    ]],
+                    "enabledTargets": [],
+                ]],
+            ]],
+        ]]
+        let model = MainViewModel(bridgeClient: BridgeClient(), queryFacade: query)
+        let container = ImportScreenContainer(state: state, mainViewModel: model)
+
         await container.importLocalDirectory("/Users/me/skills/writer")
 
-        XCTAssertEqual(model.localImportGroups.map(\.id), ["local:writer"])
-        XCTAssertEqual(query.scanPaths, ["/Users/me/skills/writer", "/Users/me/skills/writer"])
-        XCTAssertEqual(model.toast?.style, .neutral)
-        XCTAssertEqual(model.toast?.message, "This local skill is already in the scan list.")
+        let item = try XCTUnwrap(model.localImportGroups.first)
+        XCTAssertEqual(item.localImport?.selectedChoiceId, "local")
+        XCTAssertEqual(item.localImport?.choices.first?.id, "local")
+        XCTAssertEqual(item.localImport?.choices.first?.locator, "/Users/me/skills/writer")
+        XCTAssertEqual(item.localImport?.choices.first?.selectedSkills, [.repoPath("writer")])
     }
 
     func testHandleImportActionShowsToastWhenRecommendationAlreadyExistsLocally() async {
@@ -2245,11 +2315,9 @@ final class ImportScreenContainerTests: XCTestCase {
         XCTAssertEqual(MainView.homeProjectPillCornerRadius, MainView.homeFilterPillCornerRadius)
     }
 
-    func testSelectedProjectScopeUsesIndicatorWithoutLegacySubtitle() {
+    func testSelectedProjectScopeUsesSelectionIndicator() {
         XCTAssertTrue(MainView.projectScopeShowsSelectionIndicator(isSelected: true))
         XCTAssertFalse(MainView.projectScopeShowsSelectionIndicator(isSelected: false))
-        XCTAssertFalse(MainView.projectScopeShowsLegacySubtitle(isSelected: true))
-        XCTAssertFalse(MainView.projectScopeShowsLegacySubtitle(isSelected: false))
     }
 
     func testLeadingFixedButtonsUseCenteredAlignmentForStableWidth() {
@@ -2559,12 +2627,11 @@ final class ImportScreenContainerTests: XCTestCase {
             makeItem(id: "owner/repo-3", title: "Repo 3", locator: "owner/repo-3"),
         ]
 
-        await container.prefetchGroupSkillDetailsIfNeeded([
-            "owner/repo-0",
-            "owner/repo-1",
-            "owner/repo-2",
-            "owner/repo-3",
-        ])
+        async let first: Void = container.prefetchGroupSkillDetailsIfNeeded("owner/repo-0")
+        async let second: Void = container.prefetchGroupSkillDetailsIfNeeded("owner/repo-1")
+        async let third: Void = container.prefetchGroupSkillDetailsIfNeeded("owner/repo-2")
+        async let fourth: Void = container.prefetchGroupSkillDetailsIfNeeded("owner/repo-3")
+        _ = await (first, second, third, fourth)
 
         let previewLocators = await query.recordedPreviewLocators().sorted()
         let maxConcurrentPreviewCount = await query.recordedMaxConcurrentPreviewCount()
@@ -3085,7 +3152,6 @@ private actor PreviewConcurrencyRecorder {
 @MainActor
 private final class RecordingLocalImportQueryFacade: DesktopQueryTransporting {
     private(set) var scanPaths: [String?] = []
-    var localGroups: [[String: Any]] = []
     var localScanPayloads: [[String: Any]] = []
     var scanError: Error?
 
@@ -3108,7 +3174,7 @@ private final class RecordingLocalImportQueryFacade: DesktopQueryTransporting {
         scanPaths.append(path)
         let payload: [String: Any]
         if localScanPayloads.isEmpty {
-            payload = ["groups": localGroups]
+            payload = ["localScanGroups": []]
         } else {
             payload = localScanPayloads.removeFirst()
         }

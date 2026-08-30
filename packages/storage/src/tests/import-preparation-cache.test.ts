@@ -47,9 +47,13 @@ describe("import-preparation-cache", () => {
       canonicalRepo: "anthropics/skills",
       sourceKind: "git",
       status: "ready",
-      skillIds: ["review"],
-      availableTargets: ["cursor"],
     });
+    expect(cache.records["prep-1"]).not.toHaveProperty("schemaVersion");
+    expect(cache.records["prep-1"]).not.toHaveProperty("sourceSelectionKey");
+    expect(cache.records["prep-1"]).not.toHaveProperty("commitSha");
+    expect(cache.records["prep-1"]).not.toHaveProperty("skillIds");
+    expect(cache.records["prep-1"]).not.toHaveProperty("skillRefs");
+    expect(cache.records["prep-1"]).not.toHaveProperty("availableTargets");
     expect(cache.records.broken).toBeUndefined();
     expect(cache).not.toHaveProperty("locatorIndex");
   });
@@ -116,7 +120,7 @@ describe("import-preparation-cache", () => {
     expect(normalized.records["prep-1"]).toBeUndefined();
   });
 
-  test("writes import preparation cache without locatorIndex and lease", () => {
+  test("writes only fields consumed by import preparation and recovery", () => {
     const normalized = normalizeImportPreparationCache({
       records: {
         "prep-1": {
@@ -139,6 +143,61 @@ describe("import-preparation-cache", () => {
 
     expect(JSON.stringify(normalized)).not.toContain("locatorIndex");
     expect(JSON.stringify(normalized)).not.toContain("lease");
+    expect(JSON.stringify(normalized)).not.toContain("skillIds");
+    expect(JSON.stringify(normalized)).not.toContain("availableTargets");
+  });
+
+  test("discards fields that are not part of the persisted preparation record", () => {
+    const normalized = normalizeImportPreparationCache({
+      records: {
+        "prep-1": {
+          id: "prep-1",
+          preparationId: "legacy-preparation-id",
+          locator: "https://github.com/owner/repo",
+          canonicalRepo: "github:owner/repo",
+          sourceLocator: "owner/repo",
+          canonicalLocator: "github:owner/repo",
+          existingSourceIdHint: "existing-repo",
+          sourceKind: "git",
+          checkoutPath: "/tmp/source/git/repo",
+          sourceId: "repo",
+          displayName: "Repo",
+          sourceRevision: { kind: "git", commitSha: "abc123" },
+          currentAttempt: { attemptId: "attempt-1" },
+          status: "ready",
+          preparedAt: "2026-06-07T00:00:00.000Z",
+          expiresAt: "2026-06-08T00:00:00.000Z",
+          createdAt: "2026-06-06T00:00:00.000Z",
+          diagnostics: [{ code: "legacy", message: "legacy" }],
+          failure: {
+            reasonCode: "legacy",
+            retryable: true,
+            message: "legacy",
+            diagnostics: [{ code: "legacy", message: "legacy" }],
+          },
+          skillIds: ["writer"],
+          availableTargets: ["codex"],
+        },
+      },
+    });
+
+    expect(normalized.records["prep-1"]).toEqual({
+      id: "prep-1",
+      locator: "https://github.com/owner/repo",
+      canonicalRepo: "github:owner/repo",
+      sourceKind: "git",
+      checkoutPath: "/tmp/source/git/repo",
+      sourceId: "repo",
+      displayName: "Repo",
+      status: "ready",
+      preparedAt: "2026-06-07T00:00:00.000Z",
+      expiresAt: "2026-06-08T00:00:00.000Z",
+      failure: {
+        reasonCode: "legacy",
+        retryable: true,
+        message: "legacy",
+      },
+    });
   });
 
   test("accepts v2 source kinds in preparation records", () => {

@@ -3,6 +3,12 @@ import XCTest
 
 @MainActor
 final class HomeScreenContainerSortingTests: XCTestCase {
+    func testHomeRenderBuildsGroupCardsOnceAndPassesTheProjectionDownstream() throws {
+        let source = try sourceText(at: "Sources/DesktopApp/Screens/Home/MainView.swift")
+
+        XCTAssertEqual(source.components(separatedBy: "viewModel.groupCards").count - 1, 1)
+    }
+
     func testSortsByPinnedFirstThenFirstTagRankThenNameKey() {
         let snapshot = GroupTagController.HomeSnapshot(
             availableTags: [],
@@ -57,6 +63,37 @@ final class HomeScreenContainerSortingTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.id), ["she", "shu", "zi"])
     }
 
+    func testSortKeyProjectionNormalizesEachCardNameOnce() {
+        let snapshot = GroupTagController.HomeSnapshot(
+            availableTags: [],
+            tagCountsByID: [:],
+            selectedKey: nil,
+            visibleSourceIDs: ["a", "b", "c"],
+            tagsBySourceID: [:],
+            suggestionsBySourceID: [:],
+            tagRankByID: [:],
+            visibleSourceIDSet: ["a", "b", "c"]
+        )
+        let cards = [
+            card(id: "a", title: "甲", isPinned: false),
+            card(id: "b", title: "乙", isPinned: false),
+            card(id: "c", title: "丙", isPinned: false),
+        ]
+        var normalizationCount = 0
+
+        _ = HomeScreenContainer.makeHomeSortKeys(
+            for: cards,
+            snapshot: snapshot,
+            pinnedSourceIds: [],
+            nameKey: { title in
+                normalizationCount += 1
+                return title
+            }
+        )
+
+        XCTAssertEqual(normalizationCount, cards.count)
+    }
+
     private func card(id: String, title: String, isPinned: Bool) -> GroupCardModel {
         GroupCardModel(
             id: id,
@@ -83,5 +120,14 @@ final class HomeScreenContainerSortingTests: XCTestCase {
             targets: [],
             saveState: SaveState(phase: .idle, detail: nil)
         )
+    }
+
+    private func sourceText(at relativePath: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent(relativePath)
+        return try String(contentsOf: url, encoding: .utf8)
     }
 }

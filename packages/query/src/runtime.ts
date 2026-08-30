@@ -18,19 +18,14 @@ import type {
   ImportDraft,
   ImportDataCache,
   ImportGroupCandidate,
-  LocalImportDetectedSkill,
-  LocalImportValidationStatus,
-  ImportRecommendationFeed,
   ImportRecommendationFeedId,
   ImportSearchHit,
-  ImportSearchSnapshot,
   ImportPreviewResult,
   ImportPreparationResult,
   ImportReasonCode,
   ImportSourceResult,
   LeafRecord,
   LockFile,
-  LocalImportChoice,
   LocalScanGroup,
   LocalScanGroupStatus,
   LocalScanImportChoice,
@@ -55,7 +50,6 @@ import type {
   SourceUpdateResult,
   SourceUpdateResultItem,
   UnifiedSourceSnapshot,
-  UnifiedSourceTrust,
   CollectionViewRecord,
   CollectionSkillRef,
   UsageRefreshSummary,
@@ -95,7 +89,6 @@ import {
   getHostedGitOwner,
   parseGitHubRepo,
   parseHostedGitRepo,
-  resolveProjectedSkillNames,
 } from "@skill-flow/integration/utils/naming";
 import {
   getTargetScanRoots,
@@ -106,12 +99,10 @@ import {
 import { fail, ok } from "@skill-flow/integration/utils/result";
 import { searchClawHubSkills } from "@skill-flow/integration/utils/clawhub";
 import { deriveDisplayName, deriveSourceId } from "@skill-flow/integration/utils/source-id";
-import { fetchSourceDetails } from "@skill-flow/integration/utils/source-details";
 import {
   buildFailedSourceMetadataResult,
   buildSourceMetadataResult,
   fetchFreshSourceMetadata,
-  fetchSkillsDirectorySourceDetails,
   inferSourceMetadataProvider,
   SOURCE_METADATA_CACHE_TTL_MS,
 } from "@skill-flow/integration/utils/source-details";
@@ -120,9 +111,6 @@ import {
   fetchSkillsDirectoryFeedGroups,
   fetchSkillsDirectorySourceSnapshot,
   groupSkillsDirectorySearchHits,
-  IMPORT_RECOMMENDATION_CACHE_TTL_MS,
-  IMPORT_SEARCH_CACHE_TTL_MS,
-  IMPORT_SOURCE_CACHE_TTL_MS,
   normalizeImportCanonicalRepo,
   normalizeImportRepoPathSelector,
   searchSkillsDirectory,
@@ -136,8 +124,17 @@ import {
   type ExternalSourceSnapshot,
 } from "@skill-flow/core-engine/services/external-source-lifecycle";
 import { InventoryService } from "@skill-flow/core-engine/services/inventory-service";
-import { OperationRecoveryService } from "@skill-flow/core-engine/services/operation-recovery-service";
+import {
+  OperationRecoveryService,
+  type OperationRecoveryTransaction,
+} from "@skill-flow/core-engine/services/operation-recovery-service";
 import { ImportPreparationService } from "@skill-flow/core-engine/services/import-preparation-service";
+import { ImportDiscovery } from "@skill-flow/core-engine/services/import-discovery";
+import {
+  ImportSourcePolicy,
+  type GitHubImportLocator,
+  type SelectableImportLeaf,
+} from "@skill-flow/core-engine/services/import-source-policy";
 import { RecentProjectService } from "@skill-flow/core-engine/services/recent-project-service";
 import { SkillUsageService } from "@skill-flow/core-engine/services/skill-usage-service";
 import { SourceAuthorityService } from "@skill-flow/core-engine/services/source-authority-service";
@@ -160,8 +157,7 @@ import {
   type BootstrapEvent,
   type LocalSkillScanResult,
 } from "@skill-flow/core-engine/services/workspace-bootstrap-service";
-import { parseSkillFrontmatter } from "./skill-frontmatter.js";
-import type { AgentsOriginReader } from "@skill-flow/core-engine/services/legacy-agents-lock";
+import { parseSkillFrontmatter } from "@skill-flow/core-engine/services/skill-frontmatter";
 import { DeploymentReconciler } from "./deployment-reconciler.js";
 import {
   SkillCollectionMemberOriginMissingError,
@@ -177,7 +173,6 @@ const BUILT_IN_SKILL_SOURCE_ID = "skill-flow";
 const BUILT_IN_SKILL_DISPLAY_NAME = "skill-flow";
 
 export type SkillFlowAppOptions = {
-  agentsOriginReader?: AgentsOriginReader;
   builtInSkillsRoot?: string;
 };
 
@@ -226,13 +221,6 @@ type RenameSourceResult = {
   isResetToOriginal: boolean;
 };
 
-type GitHubImportLocator = {
-  canonicalRepo: string;
-  originalLocator: string;
-  locator: string;
-  requestedPath?: string;
-  skillSelector?: string;
-};
 export type CreateCollectionOptions = {
   displayName: string;
   skills: CollectionSkillRef[];
@@ -313,18 +301,7 @@ type GroupCardEnrichmentSnapshot = {
   groupPath?: string;
 };
 type RuntimeImportSkillSelection = NonNullable<ImportDraft["selectedSkills"]>[number];
-type SelectableLeaf = Pick<LeafRecord, "id" | "relativePath" | "linkName" | "title"> & {
-  name?: string;
-};
-type LocalScanResolvedSkill = {
-  scan: LocalSkillScanResult;
-  detected: LocalImportDetectedSkill;
-  canonicalRepo?: string;
-  originLocator?: string;
-  previewStatus: "ready" | "failed";
-};
-type ReadyImportPreviewResult = Extract<ImportPreviewResult, { status: "ready" }>;
-type ImportPreviewSkillCandidate = ReadyImportPreviewResult["skills"][number];
+type SelectableLeaf = SelectableImportLeaf;
 type AuditMutationName =
   | "add-source"
   | "bootstrap"
@@ -369,8 +346,8 @@ async function resolveUsableProjectPath(projectPath: string | undefined): Promis
 function normalizePreferencesFile(preferences: PreferencesFile): PreferencesFile {
   const recentProjects = normalizeRecentProjects(preferences.recentProjects);
   return {
-    ...preferences,
     schemaVersion: 2,
+    migrationGeneration: preferences.migrationGeneration,
     pinnedSourceIds: uniqueNonEmptyStrings(preferences.pinnedSourceIds),
     selectedProjectScope: normalizeSelectedProjectScope(preferences.selectedProjectScope, recentProjects),
     recentProjects,
@@ -464,6 +441,8 @@ export class SkillFlowApp {
   readonly sourceAuthorityService: SourceAuthorityService;
   readonly externalSourceLifecycle: ExternalSourceLifecycle;
   readonly importPreparationService: ImportPreparationService;
+  readonly importDiscovery: ImportDiscovery;
+  readonly importSourcePolicy: ImportSourcePolicy;
   readonly operationRecoveryService: OperationRecoveryService;
   readonly doctorService: DoctorService;
   readonly workflowService: WorkflowService;
@@ -475,9 +454,6 @@ export class SkillFlowApp {
   private readonly builtInSkillsRoot: string | undefined;
   private mutationQueue: Promise<void> = Promise.resolve();
   private metadataRefreshesBySourceId = new Map<string, Promise<void>>();
-  private importSearchRefreshesByQuery = new Map<string, Promise<ImportSearchSnapshot>>();
-  private importSourceRefreshesByKey = new Map<string, Promise<UnifiedSourceSnapshot>>();
-  private importRecommendationRefreshesByFeed = new Map<ImportRecommendationFeedId, Promise<ImportRecommendationFeed>>();
 
   constructor(options: SkillFlowAppOptions = {}) {
     this.builtInSkillsRoot = options.builtInSkillsRoot;
@@ -504,6 +480,15 @@ export class SkillFlowApp {
       sourceAuthority: this.sourceAuthorityService,
       checkoutService: this.sourceCheckoutService,
     });
+    this.importDiscovery = new ImportDiscovery({
+      store: this.store,
+      provider: {
+        fetchRecommendationGroups: fetchSkillsDirectoryFeedGroups,
+        search: searchSkillsDirectory,
+        fetchSource: fetchSkillsDirectorySourceSnapshot,
+      },
+    });
+    this.importSourcePolicy = new ImportSourcePolicy();
     this.operationRecoveryService = new OperationRecoveryService({
       stateStore: this.stateStore,
       cacheStore: this.importPreparationCacheStore,
@@ -523,7 +508,6 @@ export class SkillFlowApp {
     this.recentProjectService = new RecentProjectService();
     this.workspaceBootstrapService = new WorkspaceBootstrapService({
       stateRoot: this.stateStore.rootPath,
-      ...(options.agentsOriginReader ? { agentsOriginReader: options.agentsOriginReader } : {}),
     });
     this.usageService = new SkillUsageService({
       store: new UsageStore(this.store.rootPath),
@@ -536,11 +520,7 @@ export class SkillFlowApp {
       store: {
         readPreferences: async () => (await this.readRuntimeAuthorityView()).preferences,
         readCollections: () => this.readCollectionsForRuntime(),
-        writePreferences: async (preferences) => {
-          await this.writePreferences(preferences);
-        },
       },
-      recentProjectService: this.recentProjectService,
       doctorService: this.doctorService,
       workflowService: this.workflowService,
       getAvailableTargets: () => this.getAvailableTargets(),
@@ -646,10 +626,6 @@ export class SkillFlowApp {
     const nextPreferences = normalizePreferencesFile({
       ...preferences,
       migrationGeneration: state.preferences.migrationGeneration,
-      ...(state.preferences.localImportChoices ? { localImportChoices: state.preferences.localImportChoices } : {}),
-      ...(state.preferences.localScanImportChoices
-        ? { localScanImportChoices: state.preferences.localScanImportChoices }
-        : {}),
     });
     await this.stateStore.writeState({
       ...state,
@@ -889,7 +865,7 @@ export class SkillFlowApp {
       });
     }
 
-    const requestedPath = this.normalizeRequestedPath(addOptions.path);
+    const requestedPath = this.importSourcePolicy.normalizeRequestedPath(addOptions.path);
     const sourceLeafs = lockFile.leafInventory.filter((leaf) => leaf.sourceId === source.id);
     const availableTargets = addOptions.skipTargetDetection
       ? []
@@ -1475,7 +1451,7 @@ export class SkillFlowApp {
 
   async scanLocalImportGroups(
     localPath?: string,
-  ): Promise<Result<{ groups: ImportGroupCandidate[]; localScanGroups: LocalScanGroup[] }>> {
+  ): Promise<Result<{ localScanGroups: LocalScanGroup[] }>> {
     return this.scanLocalImportGroupsImpl(localPath);
   }
 
@@ -1620,7 +1596,7 @@ export class SkillFlowApp {
   }
 
   private async warmRebuildableCacheAfterMigration(): Promise<void> {
-    await this.refreshImportRecommendationFeedTracked("seed").catch(() => undefined);
+    await this.importDiscovery.refreshRecommendation("seed").catch(() => undefined);
     for (const feedId of ["official", "trending", "hot", "audits"] as const) {
       this.refreshImportRecommendationFeedInBackground(feedId);
     }
@@ -1806,7 +1782,7 @@ export class SkillFlowApp {
     const [sourceMetadata, sourceSnapshot] = await Promise.all([
       this.resolveSourceMetadata(source, summary.lock),
       canonicalRepo
-        ? this.resolveImportSourceSnapshot(canonicalRepo, {
+        ? this.importDiscovery.resolveSource(canonicalRepo, {
             enrichSkillIds: leafs.map((leaf) => leaf.linkName),
           }).catch(() => undefined)
         : Promise.resolve(undefined),
@@ -1886,24 +1862,28 @@ export class SkillFlowApp {
   private async listRecommendedImportGroupsImpl(): Promise<Result<{ groups: ImportGroupCandidate[] }>> {
     const manifest = await this.readManifestConsistently();
     const installedRepos = this.installedCanonicalRepos(manifest);
-    const recommendedRepos = await this.resolveRecommendedImportRepos();
-    const importCache = await this.store.readImportDataCache();
-    const groups = recommendedRepos
+    const recommendations = await this.importDiscovery.resolveRecommendations([
+      "seed",
+      "official",
+      "hot",
+      "trending",
+    ]);
+    const groups = recommendations.groups
       .slice(0, 8)
       .map((canonicalRepo) =>
-        this.buildImmediateImportGroupCandidate(importCache, canonicalRepo, {
+        this.buildImmediateImportGroupCandidate(recommendations.cachedSources, canonicalRepo, {
           installed: installedRepos.has(canonicalRepo),
         }),
       );
 
-    this.prewarmImportPreviewSnapshots(groups, importCache);
+    this.prewarmImportPreviewSnapshots(groups, recommendations.cachedSources);
 
     return ok({ groups });
   }
 
   private async scanLocalImportGroupsImpl(
     localPath?: string,
-  ): Promise<Result<{ groups: ImportGroupCandidate[]; localScanGroups: LocalScanGroup[] }>> {
+  ): Promise<Result<{ localScanGroups: LocalScanGroup[] }>> {
     try {
       const { manifest, lockFile } = await this.readRuntimeAuthorityView();
       const scanned = localPath
@@ -1912,40 +1892,9 @@ export class SkillFlowApp {
           manifest,
           lockFile,
         );
-      const installedRepos = this.installedCanonicalRepos(manifest);
-      const groupsByKey = new Map<string, LocalSkillScanResult[]>();
-
-      for (const skill of scanned) {
-        const canonicalRepo = skill.originLocator
-          ? normalizeImportCanonicalRepo(skill.originLocator)
-          : undefined;
-        const key = canonicalRepo ? `origin:${canonicalRepo}` : `local:${skill.sourceId}`;
-        const current = groupsByKey.get(key) ?? [];
-        current.push(skill);
-        groupsByKey.set(key, current);
-      }
-
-      const groupBatches = await this.mapConcurrent(
-        [...groupsByKey.entries()],
-        SkillFlowApp.importGroupResolveConcurrency,
-        async ([key, skills]) => {
-          if (key.startsWith("origin:")) {
-            return this.buildOriginLocalImportGroups(
-              key.slice("origin:".length),
-              skills,
-              installedRepos,
-              manifest,
-              lockFile,
-            );
-          }
-          return [this.buildLocalImportFallbackGroup(skills[0]!)];
-        },
-      );
-      const groups = groupBatches.flat();
-      const localScanGroups = await this.buildLocalScanGroups(scanned, manifest, lockFile);
+      const localScanGroups = this.buildLocalScanGroups(scanned, manifest);
 
       return ok({
-        groups: groups.sort((left, right) => left.title.localeCompare(right.title)),
         localScanGroups: localScanGroups.sort((left, right) => left.title.localeCompare(right.title)),
       });
     } catch (error) {
@@ -2038,516 +1987,138 @@ export class SkillFlowApp {
     return { title, description };
   }
 
-  private async buildOriginLocalImportGroups(
-    canonicalRepo: string,
-    localSkills: LocalSkillScanResult[],
-    installedRepos: Set<string>,
-    manifest: ManifestFile,
-    lockFile: LockFile,
-  ): Promise<ImportGroupCandidate[]> {
-    const normalizedRepo = normalizeImportCanonicalRepo(canonicalRepo) ?? canonicalRepo;
-    const originLocator = `https://github.com/${normalizedRepo}.git`;
-    const preview = await this.previewGitHubImportSource(normalizedRepo);
-    const readyPreview = preview?.ok && preview.data.status === "ready" ? preview.data : undefined;
-    const detectedSkills = readyPreview
-      ? localSkills.map((skill) => this.buildValidatedLocalImportSkill(skill, readyPreview.skills))
-      : localSkills.map((skill) => this.buildUnavailableLocalImportSkill(skill));
-    const validationStatus = this.aggregateLocalImportValidationStatus(detectedSkills);
-    const importableOriginSkillIds = detectedSkills.flatMap((detectedSkill, index) => {
-      const localSkill = localSkills[index];
-      if (
-        !localSkill ||
-        !detectedSkill.originSkillId ||
-        this.isLocalScanOriginAlreadyManaged(localSkill, detectedSkill, normalizedRepo, manifest, lockFile)
-      ) {
-        return [];
-      }
-      return [detectedSkill.originSkillId];
-    });
-    const selectedChoiceId = validationStatus === "matched" && importableOriginSkillIds.length > 0
-      ? "origin"
-      : "local";
-    if (validationStatus !== "matched" && localSkills.length > 1) {
-      return localSkills.map((skill, index) =>
-        this.buildLocalImportFallbackGroup(skill, detectedSkills[index]),
-      );
-    }
-
-    const matchedSkills = detectedSkills.map((skill) => ({
-      skillId: skill.originSkillId ?? skill.id,
-      title: skill.title,
-    }));
-    const originLocalImportChoices: LocalImportChoice[] = validationStatus === "matched" && importableOriginSkillIds.length > 0
-      ? [{
-          sourceChoiceId: "origin",
-          sourceChoiceAlias: "Origin",
-          label: "Origin",
-          locator: originLocator,
-          detectedSourcePath: localSkills[0]?.path ?? originLocator,
-          variant: localSkills.length === 1 ? "single-skill" : "multi-skill",
-          selectedSkills: this.importSkillSelectionsForRepoPaths(importableOriginSkillIds),
-          enabledTargets: [],
-        }]
-      : [];
-    const installed = originLocalImportChoices.length > 0
-      ? false
-      : installedRepos.has(normalizedRepo);
-
-    return [{
-      id: normalizedRepo,
-      provider: "skills",
-      locator: normalizedRepo,
-      canonicalRepo: normalizedRepo,
-      aliases: buildImportGroupCandidate({
-        canonicalRepo: normalizedRepo,
-        installed,
-      }).aliases,
-      title: normalizedRepo.split("/")[1] ?? normalizedRepo,
-      installed,
-      matchedSkillNames: localSkills.map((skill) => skill.title),
-      matchedSkills,
-      enrichState: { status: readyPreview ? "ready" : "idle" },
-      localImport: {
-        validationStatus,
-        selectedChoiceId,
-        choices: [
-          ...originLocalImportChoices,
-          ...(localSkills.length === 1 ? [this.buildLocalImportChoice(localSkills)] : []),
-        ],
-        detectedSkills,
-      },
-    }];
-  }
-
-  private localScanSkillGroupKey(item: LocalScanResolvedSkill): string {
-    if (item.canonicalRepo && item.detected.originSkillId) {
-      return `origin-skill:${item.canonicalRepo}:${item.detected.originSkillId}`;
-    }
-    const titleKey = (item.scan.title || item.scan.displayName).trim().toLowerCase();
-    const dirKey = path.basename(item.scan.path).trim().toLowerCase();
+  private localScanSkillGroupKey(skill: LocalSkillScanResult): string {
+    const titleKey = (skill.title || skill.displayName).trim().toLowerCase();
+    const dirKey = path.basename(skill.path).trim().toLowerCase();
     return `local-skill:${titleKey}:${dirKey}`;
   }
 
-  private localScanGroupStatus(statuses: LocalScanGroupStatus[]): LocalScanGroupStatus {
-    if (statuses.every((status) => status === "already-managed")) return "already-managed";
-    if (statuses.includes("version-conflict")) return "version-conflict";
-    if (statuses.includes("origin-unavailable")) return "origin-unavailable";
-    if (statuses.includes("ambiguous")) return "ambiguous";
-    if (statuses.includes("changed")) return "changed";
-    if (statuses.includes("missing")) return "missing";
-    if (statuses.every((status) => status === "matched" || status === "already-managed")) return "matched";
-    return "local-only";
-  }
-
-  private buildLocalScanGroupFromResolved(
-    groupId: string,
-    items: LocalScanResolvedSkill[],
-    alreadyManagedByPath: Map<string, boolean>,
-  ): LocalScanGroup {
-    const first = items[0]!;
-    const canonicalRepo = first.canonicalRepo;
-    const originLocator = canonicalRepo
-      ? first.originLocator ?? `https://github.com/${canonicalRepo}.git`
-      : undefined;
-    const alreadyManaged = items.every((item) => alreadyManagedByPath.get(item.scan.path) ?? false);
-    const status = this.resolveLocalScanSkillStatus(items, alreadyManaged);
-    const usesOriginSkillId = status === "matched"
-      || status === "already-managed"
-      || status === "version-conflict";
-    const skillId = usesOriginSkillId
-      ? first.detected.originSkillId ?? first.detected.id
-      : first.detected.id;
-    const title = first.detected.title || first.scan.title || first.scan.displayName;
-    const variants = this.buildLocalScanSkillVariants(items, status, alreadyManagedByPath, skillId);
-    const sourcePathsByKey = new Map<string, ReturnType<typeof this.localScanSourcePath>>();
-    for (const item of items) {
-      const sourcePath = this.localScanSourcePath(
-        item.scan,
-        alreadyManagedByPath.get(item.scan.path) ?? false,
-      );
-      sourcePathsByKey.set(`${sourcePath.path}:${sourcePath.contentHash}`, sourcePath);
+  private buildLocalScanGroups(
+    scanned: LocalSkillScanResult[],
+    manifest: ManifestFile,
+  ): LocalScanGroup[] {
+    const groupsByKey = new Map<string, LocalSkillScanResult[]>();
+    for (const skill of scanned) {
+      const key = this.localScanSkillGroupKey(skill);
+      const current = groupsByKey.get(key) ?? [];
+      current.push(skill);
+      groupsByKey.set(key, current);
     }
 
-    return {
-      id: canonicalRepo ? groupId : `local:${first.scan.sourceId}`,
-      title: canonicalRepo ? canonicalRepo.split("/")[1] ?? canonicalRepo : title,
-      status,
-      sourcePaths: [...sourcePathsByKey.values()],
-      skills: [{
-        id: skillId,
-        title,
-        status,
-        variants,
-        selectionRequired: status === "version-conflict" || status === "changed" || status === "ambiguous",
-        ...(first.detected.originSkillId ? { originSkillId: first.detected.originSkillId } : {}),
-      }],
-      importChoices: this.buildLocalScanImportChoices({
-        status,
-        canonicalRepo,
-        originLocator,
-        skillIds: [skillId],
-        localSkills: items.map((item) => item.scan),
-        alreadyManaged,
-      }),
-      ...(canonicalRepo && originLocator
-        ? {
-            origin: {
-              canonicalRepo,
-              locator: originLocator,
-              previewStatus: first.previewStatus,
-            },
-          }
-        : {}),
-    };
-  }
-
-  private resolveLocalScanSkillStatus(
-    items: LocalScanResolvedSkill[],
-    alreadyManaged: boolean,
-  ): LocalScanGroupStatus {
-    if (alreadyManaged) {
-      return "already-managed";
-    }
-    const contentHashes = new Set(items.map((item) => item.scan.contentHash));
-    if (contentHashes.size > 1) {
-      return "version-conflict";
-    }
-    return this.aggregateLocalImportValidationStatus(
-      items.map((item) => item.detected),
+    return [...groupsByKey.values()].map((skills) =>
+      this.buildLocalScanGroup(skills, manifest),
     );
   }
 
+  private buildLocalScanGroup(
+    skills: LocalSkillScanResult[],
+    manifest: ManifestFile,
+  ): LocalScanGroup {
+    const first = skills[0]!;
+    const alreadyManagedByPath = new Map(
+      skills.map((skill) => [
+        skill.path,
+        this.isLocalScanAlreadyManaged(skill, manifest),
+      ]),
+    );
+    const alreadyManaged = skills.every(
+      (skill) => alreadyManagedByPath.get(skill.path) ?? false,
+    );
+    const contentHashes = new Set(skills.map((skill) => skill.contentHash));
+    const status: LocalScanGroupStatus = alreadyManaged
+      ? "already-managed"
+      : contentHashes.size > 1
+        ? "version-conflict"
+        : "local-only";
+    const skillId = first.displayName;
+    const variants = this.buildLocalScanSkillVariants(
+      skills,
+      status,
+      alreadyManagedByPath,
+      skillId,
+    );
+    const sourcePaths = new Map<string, ReturnType<typeof this.localScanSourcePath>>();
+    for (const skill of skills) {
+      const sourcePath = this.localScanSourcePath(
+        skill,
+        alreadyManagedByPath.get(skill.path) ?? false,
+      );
+      sourcePaths.set(`${sourcePath.path}:${sourcePath.contentHash}`, sourcePath);
+    }
+
+    return {
+      id: `local:${first.sourceId}`,
+      title: first.title || first.displayName,
+      status,
+      sourcePaths: [...sourcePaths.values()],
+      skills: [{
+        id: skillId,
+        title: first.title || first.displayName,
+        status,
+        variants,
+        selectionRequired: status === "version-conflict",
+      }],
+      importChoices: this.buildLocalScanImportChoices(skills, status, alreadyManaged),
+    };
+  }
+
   private buildLocalScanSkillVariants(
-    items: LocalScanResolvedSkill[],
+    skills: LocalSkillScanResult[],
     status: LocalScanGroupStatus,
     alreadyManagedByPath: Map<string, boolean>,
     skillId: string,
   ): LocalScanSkillVariant[] {
     const variantsByHash = new Map<string, LocalScanSkillVariant>();
-    for (const item of items) {
-      if (variantsByHash.has(item.scan.contentHash)) {
+    for (const skill of skills) {
+      if (variantsByHash.has(skill.contentHash)) {
         continue;
       }
-      const alreadyManaged = alreadyManagedByPath.get(item.scan.path) ?? false;
-      variantsByHash.set(item.scan.contentHash, {
-        id: `${skillId}:${item.scan.contentHash}`,
-        path: item.scan.path,
-        contentHash: item.scan.contentHash,
+      const alreadyManaged = alreadyManagedByPath.get(skill.path) ?? false;
+      variantsByHash.set(skill.contentHash, {
+        id: `${skillId}:${skill.contentHash}`,
+        path: skill.path,
+        contentHash: skill.contentHash,
         selectedByDefault: false,
         importable: !alreadyManaged,
       });
     }
     const variants = [...variantsByHash.values()];
-    if (
-      variants.length === 1
-      && variants[0]?.importable
-      && status !== "version-conflict"
-    ) {
+    if (variants.length === 1 && variants[0]?.importable && status !== "version-conflict") {
       variants[0] = { ...variants[0]!, selectedByDefault: true };
     }
     return variants;
   }
 
-  private buildLocalScanImportChoices(options: {
-    status: LocalScanGroupStatus;
-    canonicalRepo: string | undefined;
-    originLocator: string | undefined;
-    skillIds: string[];
-    localSkills: LocalSkillScanResult[];
-    alreadyManaged: boolean;
-  }): LocalScanImportChoice[] {
-    if (options.status === "version-conflict" || options.alreadyManaged) {
+  private buildLocalScanImportChoices(
+    skills: LocalSkillScanResult[],
+    status: LocalScanGroupStatus,
+    alreadyManaged: boolean,
+  ): LocalScanImportChoice[] {
+    if (status === "version-conflict" || alreadyManaged) {
       return [];
     }
-    if (options.status === "matched" && options.canonicalRepo && options.originLocator) {
-      const originChoice: LocalScanImportChoice = {
-        scanId: options.canonicalRepo,
-        sourceChoiceId: "origin",
-        rootPath: options.originLocator,
-        sourcePath: options.originLocator,
-        variant: options.localSkills.length > 1 ? "multi-source" : "single-source",
-        detectedSkills: options.localSkills.map((skill) => this.localScanDetectedSkill(skill)),
-        selectedSkills: this.importSkillSelectionsForRepoPaths(options.skillIds),
-        enabledTargets: [],
-      };
-      if (options.localSkills.length === 1) {
-        const localSkill = options.localSkills[0]!;
-        return [{
-          scanId: options.canonicalRepo,
-          sourceChoiceId: "local",
-          rootPath: localSkill.path,
-          sourcePath: localSkill.path,
-          variant: "single-source",
-          detectedSkills: [this.localScanDetectedSkill(localSkill)],
-          selectedSkills: this.importSkillSelectionsForRepoPaths([localSkill.displayName]),
-          enabledTargets: [],
-        }, originChoice];
-      }
-      return [originChoice];
-    }
-    const localSkill = options.localSkills[0];
+    const first = skills[0];
     return [{
-      scanId: localSkill?.sourceId ?? "local",
+      scanId: first?.sourceId ?? "local",
       sourceChoiceId: "local",
-      rootPath: localSkill?.path ?? "",
-      sourcePath: localSkill?.path ?? "",
-      variant: options.localSkills.length > 1 ? "multi-source" : "single-source",
-      detectedSkills: options.localSkills.map((skill) => this.localScanDetectedSkill(skill)),
-      selectedSkills: this.importSkillSelectionsForRepoPaths(options.localSkills.map((skill) => skill.displayName)),
+      rootPath: first?.path ?? "",
+      sourcePath: first?.path ?? "",
+      variant: skills.length > 1 ? "multi-source" : "single-source",
+      detectedSkills: skills.map((skill) => this.localScanDetectedSkill(skill)),
+      selectedSkills: this.importSkillSelectionsForRepoPaths(
+        skills.map((skill) => skill.displayName),
+      ),
       enabledTargets: [],
     }];
   }
 
-  private buildMergedLocalScanImportChoices(skillGroups: LocalScanGroup[]): LocalScanImportChoice[] {
-    const firstOrigin = skillGroups[0]?.origin;
-    const importableSkillIds = skillGroups
-      .filter((group) =>
-        group.status === "matched" &&
-        group.importChoices.some((choice) => choice.sourceChoiceId === "origin"),
-      )
-      .flatMap((group) => group.skills.map((skill) => skill.originSkillId ?? skill.id));
-    if (
-      firstOrigin &&
-      importableSkillIds.length > 0 &&
-      skillGroups.every((group) =>
-        group.origin?.canonicalRepo === firstOrigin.canonicalRepo &&
-        (
-          group.status === "already-managed" ||
-          (
-            group.status === "matched" &&
-            group.importChoices.some((choice) => choice.sourceChoiceId === "origin")
-          )
-        ),
-      )
-    ) {
-      return [{
-        scanId: firstOrigin.canonicalRepo,
-        sourceChoiceId: "origin",
-        rootPath: firstOrigin.locator,
-        sourcePath: firstOrigin.locator,
-        variant: "multi-source",
-        detectedSkills: skillGroups.flatMap((group) =>
-          group.skills.flatMap((skill) =>
-            skill.variants.map((variant) => ({
-              leafId: skill.originSkillId ?? skill.id,
-              sourcePath: variant.path,
-              skillFilePath: path.join(variant.path, "SKILL.md"),
-              relativePath: skill.originSkillId ?? skill.id,
-              displayName: skill.title,
-              contentHash: variant.contentHash,
-              selector: {
-                kind: "repoPath" as const,
-                path: skill.originSkillId ?? skill.id,
-              },
-            })),
-          ),
-        ),
-        selectedSkills: this.importSkillSelectionsForRepoPaths(importableSkillIds),
-        enabledTargets: [],
-      }];
-    }
-
-    return [];
-  }
-
-  private async buildLocalScanGroups(
-    scanned: LocalSkillScanResult[],
-    manifest: ManifestFile,
-    lockFile: LockFile,
-  ): Promise<LocalScanGroup[]> {
-    const resolved = await this.mapConcurrent(
-      scanned,
-      SkillFlowApp.importGroupResolveConcurrency,
-      async (skill) => this.resolveLocalScanSkill(skill),
-    );
-    const alreadyManagedByPath = new Map(
-      resolved.map((item) => [
-        item.scan.path,
-        this.isLocalScanAlreadyManaged(item, manifest, lockFile),
-      ]),
-    );
-    const groupsByKey = new Map<string, LocalScanResolvedSkill[]>();
-
-    for (const item of resolved) {
-      const key = item.canonicalRepo
-        ? `origin:${item.canonicalRepo}`
-        : this.localScanSkillGroupKey(item);
-      const current = groupsByKey.get(key) ?? [];
-      current.push(item);
-      groupsByKey.set(key, current);
-    }
-
-    return [...groupsByKey.entries()].flatMap(([groupId, groupItems]) => {
-      const skillGroupsByKey = new Map<string, LocalScanResolvedSkill[]>();
-      for (const item of groupItems) {
-        const skillGroupKey = this.localScanSkillGroupKey(item);
-        const current = skillGroupsByKey.get(skillGroupKey) ?? [];
-        current.push(item);
-        skillGroupsByKey.set(skillGroupKey, current);
-      }
-
-      const skillGroups = [...skillGroupsByKey.entries()].map(([skillGroupId, skillGroupItems]) => {
-        const baseGroupId = groupId.startsWith("origin:")
-          ? groupId.slice("origin:".length)
-          : skillGroupId;
-        const localScanGroupId = groupId.startsWith("origin:") && skillGroupsByKey.size > 1
-          ? `${baseGroupId}:${skillGroupId}`
-          : baseGroupId;
-        return this.buildLocalScanGroupFromResolved(
-          localScanGroupId,
-          skillGroupItems,
-          alreadyManagedByPath,
-        );
-      });
-      if (skillGroups.length === 1) {
-        return [skillGroups[0]!];
-      }
-
-      const importChoices = this.buildMergedLocalScanImportChoices(skillGroups);
-      if (importChoices.length === 0) {
-        return skillGroups;
-      }
-
-      const firstGroup = skillGroups[0]!;
-      return [{
-        id: groupId.startsWith("origin:") ? groupId.slice("origin:".length) : groupId,
-        title: firstGroup.origin?.canonicalRepo.split("/")[1]
-          ?? firstGroup.origin?.canonicalRepo
-          ?? firstGroup.title,
-        status: this.localScanGroupStatus(skillGroups.map((group) => group.status)),
-        sourcePaths: skillGroups.flatMap((group) => group.sourcePaths),
-        skills: skillGroups.flatMap((group) => group.skills),
-        importChoices,
-        ...(firstGroup.origin ? { origin: firstGroup.origin } : {}),
-      }];
-    });
-  }
-
-  private async resolveLocalScanSkill(skill: LocalSkillScanResult): Promise<LocalScanResolvedSkill> {
-    const canonicalRepo = skill.originLocator
-      ? normalizeImportCanonicalRepo(skill.originLocator)
-      : undefined;
-    if (!canonicalRepo) {
-      return {
-        scan: skill,
-        detected: {
-          id: skill.displayName,
-          title: skill.title || skill.displayName,
-          localPath: skill.path,
-          discoveredTargets: skill.importedFromTargets,
-          validationStatus: "local-only",
-        },
-        previewStatus: "failed",
-      };
-    }
-
-    const preview = await this.previewGitHubImportSource(canonicalRepo);
-    const readyPreview = preview?.ok && preview.data.status === "ready" ? preview.data : undefined;
-    return {
-      scan: skill,
-      detected: readyPreview
-        ? this.buildValidatedLocalImportSkill(skill, readyPreview.skills)
-        : this.buildUnavailableLocalImportSkill(skill),
-      canonicalRepo,
-      originLocator: skill.originLocator ?? `https://github.com/${canonicalRepo}.git`,
-      previewStatus: readyPreview ? "ready" : "failed",
-    };
-  }
-
   private isLocalScanAlreadyManaged(
-    item: LocalScanResolvedSkill,
+    skill: LocalSkillScanResult,
     manifest: ManifestFile,
-    lockFile: LockFile,
   ): boolean {
-    const resolvedSkillPath = path.resolve(item.scan.path);
-
-    return manifest.sources.some((source) => {
-      if (source.kind === "local" && path.resolve(source.locator) === resolvedSkillPath) {
-        return true;
-      }
-
-      const sourceRepo = normalizeImportCanonicalRepo(source.locator)
-        ?? normalizeImportCanonicalRepo(source.canonicalLocator);
-      if (!sourceRepo || !item.canonicalRepo || sourceRepo !== item.canonicalRepo) {
-        return false;
-      }
-
-      return this.isLocalScanOriginSkillManaged(
-        source.id,
-        item.scan,
-        item.detected,
-        manifest,
-        lockFile,
-      );
-    });
-  }
-
-  private isLocalScanOriginAlreadyManaged(
-    localSkill: LocalSkillScanResult,
-    detectedSkill: LocalImportDetectedSkill,
-    canonicalRepo: string,
-    manifest: ManifestFile,
-    lockFile: LockFile,
-  ): boolean {
-    return manifest.sources.some((source) => {
-      const sourceRepo = normalizeImportCanonicalRepo(source.locator)
-        ?? normalizeImportCanonicalRepo(source.canonicalLocator);
-      if (!sourceRepo || sourceRepo !== canonicalRepo) {
-        return false;
-      }
-      return this.isLocalScanOriginSkillManaged(
-        source.id,
-        localSkill,
-        detectedSkill,
-        manifest,
-        lockFile,
-      );
-    });
-  }
-
-  private isLocalScanOriginSkillManaged(
-    sourceId: string,
-    localSkill: LocalSkillScanResult,
-    detectedSkill: LocalImportDetectedSkill,
-    manifest: ManifestFile,
-    lockFile: LockFile,
-  ): boolean {
-    const source = manifest.sources.find((record) => record.id === sourceId);
-    const sourceLeafs = lockFile.leafInventory.filter((leaf) => leaf.sourceId === sourceId);
-    const binding = manifest.bindings[sourceId];
-    const selectedLeafIds = binding?.selectionMode === "all"
-      ? lockFile.sources[sourceId]?.leafIds ?? []
-      : binding?.selectedLeafIds ?? [];
-    if (
-      binding?.selectionMode === "all" ||
-      (sourceLeafs.length > 0 && selectedLeafIds.length >= sourceLeafs.length)
-    ) {
-      return true;
-    }
-
-    const selectedLeafs = sourceLeafs.filter((leaf) => selectedLeafIds.includes(leaf.id));
-    const candidates = this.localScanManagedSkillCandidates(localSkill, detectedSkill);
-    return selectedLeafs.some((leaf) =>
-      candidates.has(leaf.relativePath) ||
-      candidates.has(leaf.title) ||
-      candidates.has(leaf.linkName) ||
-      candidates.has(path.posix.basename(leaf.relativePath)),
-    );
-  }
-
-  private localScanManagedSkillCandidates(
-    localSkill: LocalSkillScanResult,
-    detectedSkill: LocalImportDetectedSkill,
-  ): Set<string> {
-    return new Set(
-      [
-        detectedSkill.originSkillId,
-        localSkill.originRequestedPath,
-        localSkill.displayName,
-        path.basename(localSkill.path),
-      ]
-        .map((value) => value?.trim())
-        .filter((value): value is string => Boolean(value)),
+    const resolvedSkillPath = path.resolve(skill.path);
+    return manifest.sources.some(
+      (source) => source.kind === "local" && path.resolve(source.locator) === resolvedSkillPath,
     );
   }
 
@@ -2562,53 +2133,6 @@ export class SkillFlowApp {
       ...(skill.importedFromTargets[0] ? { target: skill.importedFromTargets[0] } : {}),
       contentHash: skill.contentHash,
       alreadyManaged,
-    };
-  }
-
-  private buildLocalImportFallbackGroup(
-    skill: LocalSkillScanResult,
-    detectedSkill?: LocalImportDetectedSkill,
-  ): ImportGroupCandidate {
-    const canonicalRepo = `local:${skill.sourceId}`;
-    const fallbackDetectedSkill = detectedSkill ?? {
-      id: skill.displayName,
-      title: skill.title || skill.displayName,
-      localPath: skill.path,
-      discoveredTargets: skill.importedFromTargets,
-      validationStatus: "local-only" as const,
-    };
-    return {
-      id: canonicalRepo,
-      provider: "local",
-      locator: skill.path,
-      canonicalRepo,
-      aliases: [skill.path, `file://${skill.path}`],
-      title: skill.title || skill.displayName,
-      installed: false,
-      ...(skill.description ? { summary: skill.description } : {}),
-      matchedSkillNames: [skill.title || skill.displayName],
-      matchedSkills: [{ skillId: skill.displayName, title: skill.title || skill.displayName }],
-      enrichState: { status: "idle" },
-      localImport: {
-        validationStatus: fallbackDetectedSkill.validationStatus,
-        selectedChoiceId: "local",
-        choices: [this.buildLocalImportChoice([skill])],
-        detectedSkills: [fallbackDetectedSkill],
-      },
-    };
-  }
-
-  private buildLocalImportChoice(localSkills: LocalSkillScanResult[]): LocalImportChoice {
-    const localPath = localSkills[0]?.path ?? "";
-    return {
-      sourceChoiceId: "local" as const,
-      sourceChoiceAlias: "Local",
-      label: "Local",
-      locator: localPath,
-      detectedSourcePath: localPath,
-      variant: localSkills.length > 1 ? "multi-skill" : "single-skill",
-      selectedSkills: this.importSkillSelectionsForRepoPaths(localSkills.map((skill) => skill.displayName)),
-      enabledTargets: [],
     };
   }
 
@@ -2637,123 +2161,6 @@ export class SkillFlowApp {
     }));
   }
 
-  private buildUnavailableLocalImportSkill(skill: LocalSkillScanResult): LocalImportDetectedSkill {
-    return {
-      id: skill.displayName,
-      title: skill.title || skill.displayName,
-      localPath: skill.path,
-      discoveredTargets: skill.importedFromTargets,
-      validationStatus: "origin-unavailable",
-    };
-  }
-
-  private buildValidatedLocalImportSkill(
-    skill: LocalSkillScanResult,
-    originSkills: ImportPreviewSkillCandidate[],
-  ): LocalImportDetectedSkill {
-    const matches = this.matchLocalImportOriginSkills(skill, originSkills);
-    if (matches.length === 0) {
-      return {
-        id: skill.displayName,
-        title: skill.title || skill.displayName,
-        localPath: skill.path,
-        discoveredTargets: skill.importedFromTargets,
-        validationStatus: "missing",
-      };
-    }
-    if (matches.length > 1) {
-      return {
-        id: skill.displayName,
-        title: skill.title || skill.displayName,
-        localPath: skill.path,
-        discoveredTargets: skill.importedFromTargets,
-        validationStatus: "ambiguous",
-      };
-    }
-
-    const match = matches[0]!;
-    const validationStatus = this.localImportSkillChanged(skill, match) ? "changed" : "matched";
-    return {
-      id: skill.displayName,
-      title: skill.title || skill.displayName,
-      localPath: skill.path,
-      discoveredTargets: skill.importedFromTargets,
-      validationStatus,
-      originSkillId: match.providerSkillId,
-    };
-  }
-
-  private matchLocalImportOriginSkills(
-    skill: LocalSkillScanResult,
-    originSkills: ImportPreviewSkillCandidate[],
-  ): ImportPreviewSkillCandidate[] {
-    const originRequestedPath = skill.originRequestedPath?.trim();
-    if (originRequestedPath) {
-      const matches = originSkills.filter((originSkill) =>
-        originSkill.providerSkillId === originRequestedPath ||
-        originSkill.selector.path === originRequestedPath ||
-        originSkill.selectorAliases.includes(originRequestedPath)
-      );
-      if (matches.length > 0) {
-        return matches;
-      }
-    }
-
-    const localDirectoryName = path.basename(skill.path);
-    const leafMatches = originSkills.filter((originSkill) => {
-      const ids = [
-        originSkill.providerSkillId,
-        originSkill.selector.path,
-        ...originSkill.selectorAliases,
-      ];
-      return ids.some((id) => id === localDirectoryName || id.endsWith(`/${localDirectoryName}`));
-    });
-    if (leafMatches.length > 0) {
-      return leafMatches;
-    }
-
-    const normalizedLocalTitle = skill.title.trim().toLowerCase();
-    if (normalizedLocalTitle) {
-      const titleMatches = originSkills.filter(
-        (originSkill) => originSkill.title.trim().toLowerCase() === normalizedLocalTitle,
-      );
-      if (titleMatches.length > 0) {
-        return titleMatches;
-      }
-    }
-
-    return originSkills.filter((originSkill) =>
-      originSkill.providerSkillId === skill.displayName ||
-      originSkill.selector.path === skill.displayName ||
-      originSkill.selectorAliases.includes(skill.displayName)
-    );
-  }
-
-  private localImportSkillChanged(
-    skill: LocalSkillScanResult,
-    originSkill: ImportPreviewSkillCandidate,
-  ): boolean {
-    if (originSkill.contentHash && skill.contentHash !== originSkill.contentHash) {
-      return true;
-    }
-    const localTitle = skill.title.trim();
-    return Boolean(localTitle && originSkill.title.trim() && localTitle !== originSkill.title.trim());
-  }
-
-  private aggregateLocalImportValidationStatus(
-    detectedSkills: LocalImportDetectedSkill[],
-  ): LocalImportValidationStatus {
-    if (detectedSkills.every((skill) => skill.validationStatus === "matched")) {
-      return "matched";
-    }
-    for (const status of ["origin-unavailable", "ambiguous", "changed", "missing"] as const) {
-      if (detectedSkills.some((skill) => skill.validationStatus === status)) {
-        return status;
-      }
-    }
-    return "local-only";
-  }
-
   private async searchImportGroupsImpl(
     query: string,
   ): Promise<Result<{ groups: ImportGroupCandidate[]; exact: boolean }>> {
@@ -2769,7 +2176,6 @@ export class SkillFlowApp {
 
       const manifest = await this.readManifestConsistently();
       const installedRepos = this.installedCanonicalRepos(manifest);
-      const importCache = await this.store.readImportDataCache();
       const directCandidate = await this.buildDirectImportGroupCandidate(
         normalizedQuery,
         manifest,
@@ -2780,51 +2186,38 @@ export class SkillFlowApp {
           exact: true,
         });
       }
-      const exactLocator = this.parseGitHubImportLocator(normalizedQuery);
+      const exactLocator = this.importSourcePolicy.parseGitHubLocator(normalizedQuery);
       const exactRepo = exactLocator?.canonicalRepo;
       if (exactRepo) {
+        const matchedSkillNames = this.importSourcePolicy.matchedSkillNames(exactLocator);
+        const matchedSkills = matchedSkillNames.map((skillName) => ({
+          skillId: skillName,
+          title: skillName,
+        }));
         try {
-          const details = await fetchSkillsDirectorySourceDetails(exactRepo);
-          const matchedSkillNames = this.importLocatorMatchedSkillNames(exactLocator);
+          const snapshot = await this.importDiscovery.resolveSource(exactRepo, {
+            includeSkillDetails: false,
+            refreshTrustInBackground: false,
+          });
+          const candidate = buildImportGroupCandidate({
+            canonicalRepo: exactRepo,
+            locator: exactLocator.originalLocator,
+            installed: installedRepos.has(exactRepo),
+            snapshot,
+            ...(matchedSkills.length ? { matchedSkills } : {}),
+          });
           return ok({
-            groups: [
-              {
-                id: exactRepo,
-                provider: "skills",
-                locator: exactLocator.originalLocator,
-                canonicalRepo: exactRepo,
-                aliases: [
-                  exactLocator.originalLocator,
-                  exactRepo,
-                  `https://github.com/${exactRepo}`,
-                  `https://github.com/${exactRepo}.git`,
-                  `git@github.com:${exactRepo}.git`,
-                ].filter((value, index, values) => values.indexOf(value) === index),
-                title: details.repoLabel?.split("/")[1] ?? exactRepo.split("/")[1] ?? exactRepo,
-                installed: installedRepos.has(exactRepo),
-                ...(details.description ? { summary: details.description } : {}),
-                ...(details.sourceUrl ? { sourceUrl: details.sourceUrl } : {}),
-                ...(details.repoUrl ? { repoUrl: details.repoUrl } : {}),
-                ...(details.starCount !== undefined ? { starCount: details.starCount } : {}),
-                ...(details.totalInstalls !== undefined ? { totalInstalls: details.totalInstalls } : {}),
-                ...(matchedSkillNames.length ? { matchedSkillNames } : {}),
-                enrichState: { status: "ready" as const },
-              },
-            ],
+            groups: [{
+              ...candidate,
+              aliases: [exactLocator.originalLocator, ...candidate.aliases]
+                .filter((value, index, values) => values.indexOf(value) === index),
+            }],
             exact: true,
           });
         } catch (error) {
-          const matchedSkillNames = this.importLocatorMatchedSkillNames(exactLocator);
-          const exactCandidate = this.buildImmediateImportGroupCandidate(importCache, exactRepo, {
+          const exactCandidate = this.buildImmediateImportGroupCandidate({}, exactRepo, {
             installed: installedRepos.has(exactRepo),
-            ...(matchedSkillNames.length
-              ? {
-                  matchedSkills: matchedSkillNames.map((skillName) => ({
-                    skillId: skillName,
-                    title: skillName,
-                  })),
-                }
-              : {}),
+            ...(matchedSkills.length ? { matchedSkills } : {}),
           });
           const resolvedExactCandidate = exactLocator.originalLocator !== exactRepo
             ? {
@@ -2859,10 +2252,11 @@ export class SkillFlowApp {
         }
       }
 
-      const searchSnapshot = await this.resolveImportSearchSnapshot(normalizedQuery);
+      const importCache = await this.store.readImportDataCache();
+      const searchSnapshot = await this.importDiscovery.resolveSearch(normalizedQuery);
       const grouped = groupSkillsDirectorySearchHits(searchSnapshot.hits).slice(0, 8);
       const groups = grouped.map((group) =>
-        this.buildImmediateImportGroupCandidate(importCache, group.canonicalRepo, {
+        this.buildImmediateImportGroupCandidate(importCache.repos, group.canonicalRepo, {
           installed: installedRepos.has(group.canonicalRepo),
           matchedSkills: group.matchedSkills,
         }),
@@ -2881,7 +2275,7 @@ export class SkillFlowApp {
   }
 
   private async prepareImportSourceImpl(locator: string): Promise<Result<ImportPreparationResult>> {
-    const githubLocator = this.parseGitHubImportLocator(locator);
+    const githubLocator = this.importSourcePolicy.parseGitHubLocator(locator);
     if (githubLocator) {
       return this.importPreparationService.prepareImportSource(githubLocator.locator, {
         project: false,
@@ -2889,7 +2283,7 @@ export class SkillFlowApp {
       });
     }
 
-    const directLocator = await this.resolveDirectImportLocator(locator);
+    const directLocator = await this.importSourcePolicy.resolveDirectLocator(locator);
     return this.importPreparationService.prepareImportSource(directLocator ?? locator.trim(), {
       project: false,
     });
@@ -2912,7 +2306,7 @@ export class SkillFlowApp {
       preparation.sourceKind,
       preparation.sourceId,
     );
-    await this.operationRecoveryService.begin({
+    const transaction = await this.operationRecoveryService.begin({
       kind: "import",
       sourceId: preparation.sourceId,
       sourceKind: preparation.sourceKind,
@@ -2924,7 +2318,7 @@ export class SkillFlowApp {
       return this.recoverInterruptedOperationOrReturn(committed);
     }
     if (committed.data.status !== "ready") {
-      await this.operationRecoveryService.commit();
+      await transaction.commit();
       return ok(committed.data, committed.warnings);
     }
     const committedData = committed.data;
@@ -2950,7 +2344,7 @@ export class SkillFlowApp {
       committedData.sourceId,
       finalDraft.data,
       { kind: "global" },
-      { recoverable: true },
+      transaction,
     );
     if (!applied.ok) {
       return this.recoverInterruptedOperationOrReturn(ok({
@@ -2963,17 +2357,17 @@ export class SkillFlowApp {
     await this.replaceLocalImportWithManagedSymlink(
       localSkillPath,
       committedData.sourceId,
-      { recoverable: true },
+      transaction,
     );
-    await this.operationRecoveryService.checkpoint();
-    await this.operationRecoveryService.commit();
+    await transaction.checkpoint();
+    await transaction.commit();
 
     return ok(committedData, [...committed.warnings, ...finalDraft.warnings, ...applied.warnings]);
   }
 
   private async previewImportSourceImpl(locator: string): Promise<Result<ImportPreviewResult>> {
     await this.stateStore.init();
-    const githubLocator = this.parseGitHubImportLocator(locator);
+    const githubLocator = this.importSourcePolicy.parseGitHubLocator(locator);
     const canonicalRepo = githubLocator?.canonicalRepo;
     if (!canonicalRepo) {
       const localPreview = await this.previewDirectImportSource(locator);
@@ -2998,7 +2392,7 @@ export class SkillFlowApp {
     }
 
     try {
-      const snapshot = await this.resolveImportPreviewSnapshot(canonicalRepo);
+      const snapshot = await this.importDiscovery.resolvePreviewSource(canonicalRepo);
       const availableTargets = await this.getAvailableTargets();
       const snapshotSkills = githubLocator.skillSelector
         ? this.filterImportSnapshotSkills(snapshot.skills, githubLocator.skillSelector, canonicalRepo)
@@ -3068,7 +2462,7 @@ export class SkillFlowApp {
     locator: string,
     draft?: ImportDraft,
   ): Promise<Result<ImportSourceResult>> {
-    const githubLocator = this.parseGitHubImportLocator(locator);
+    const githubLocator = this.importSourcePolicy.parseGitHubLocator(locator);
     const normalizedLocator = githubLocator?.locator ?? locator.trim();
     const localSkillPath = githubLocator
       ? undefined
@@ -3090,67 +2484,42 @@ export class SkillFlowApp {
         }
       : undefined);
     const canonicalRepo = githubLocator?.canonicalRepo ?? normalizeImportCanonicalRepo(normalizedLocator);
-    if (preparation.ok && preparation.data.status === "ready") {
-      return this.commitPreparedImportSourceImpl(
-        preparation.data.preparationId,
-        importDraft,
-        canonicalRepo,
-        localSkillPath,
-      );
-    }
-
-    const prepared = await this.prepareAddSourceImpl(normalizedLocator, {
-      project: false,
-      ...(githubLocator?.requestedPath ? { path: githubLocator.requestedPath } : {}),
-    });
-    if (!prepared.ok) {
+    if (!preparation.ok) {
       return ok({
         status: "failed",
-        reasonCode: prepared.errors[0]?.code ?? "IMPORT_PREPARE_FAILED",
+        reasonCode: preparation.errors[0]?.code ?? "IMPORT_PREPARE_FAILED",
         retryable: true,
-      });
+      }, preparation.warnings);
     }
 
-    const finalDraft = this.resolveImportDraftForPreparedSource(
-      prepared.data.leafs,
-      prepared.data.availableTargets,
-      canonicalRepo,
+    if (preparation.data.status === "failed") {
+      return ok({
+        status: "failed",
+        reasonCode: preparation.data.reasonCode,
+        retryable: preparation.data.retryable,
+      }, preparation.warnings);
+    }
+
+    if (preparation.data.status !== "ready") {
+      return ok({
+        status: "failed",
+        reasonCode: `IMPORT_PREPARATION_${preparation.data.status.toUpperCase()}`,
+        retryable: true,
+      }, preparation.warnings);
+    }
+
+    return this.commitPreparedImportSourceImpl(
+      preparation.data.preparationId,
       importDraft,
+      canonicalRepo,
+      localSkillPath,
     );
-    if (!finalDraft.ok) {
-      await this.rollbackPreparedSourceInternal(prepared.data.sourceId);
-      return ok({
-        status: "failed",
-        reasonCode: finalDraft.errors[0]?.code ?? "IMPORT_PREVIEW_INVALID",
-        retryable: true,
-      });
-    }
-
-    const applied = await this.applyDraftImpl(prepared.data.sourceId, finalDraft.data, { kind: "global" });
-    if (!applied.ok) {
-      await this.rollbackPreparedSourceInternal(prepared.data.sourceId);
-      return ok({
-        status: "failed",
-        reasonCode: applied.errors[0]?.code ?? "IMPORT_APPLY_FAILED",
-        retryable: true,
-      }, [...finalDraft.warnings, ...applied.warnings]);
-    }
-
-    if (localSkillPath) {
-      await this.replaceLocalImportWithManagedSymlink(localSkillPath, prepared.data.sourceId);
-    }
-
-    return ok({
-      status: "ready",
-      sourceId: prepared.data.sourceId,
-      canonicalRepo: canonicalRepo ?? normalizedLocator,
-    }, [...finalDraft.warnings, ...applied.warnings]);
   }
 
   private async replaceLocalImportWithManagedSymlink(
     localSkillPath: string | undefined,
     sourceId: string,
-    options: { recoverable?: boolean } = {},
+    transaction?: OperationRecoveryTransaction,
   ): Promise<void> {
     if (!localSkillPath) {
       return;
@@ -3162,8 +2531,8 @@ export class SkillFlowApp {
     const { lockFile } = await this.readRuntimeAuthorityView();
     const source = lockFile.sources[sourceId];
     if (source?.localPath) {
-      if (options.recoverable) {
-        await this.operationRecoveryService.prepareManagedSymlinkMutation(
+      if (transaction) {
+        await transaction.prepareManagedSymlinkMutation(
           localSkillPath,
           source.localPath,
           { sourceId, target: targetOwnership.target },
@@ -3288,14 +2657,6 @@ export class SkillFlowApp {
     };
   }
 
-  private importRecommendationSeedRepos(): string[] {
-    return [
-      "anthropics/skills",
-      "garrytan/gstack",
-      "vercel-labs/agent-skills",
-    ];
-  }
-
   private installedCanonicalRepos(manifest: RuntimeManifestView | ManifestFile): Set<string> {
     return new Set(
       manifest.sources.flatMap((source) => {
@@ -3311,7 +2672,7 @@ export class SkillFlowApp {
   }
 
   private buildImmediateImportGroupCandidate(
-    importCache: ImportDataCache,
+    cachedSources: ImportDataCache["repos"],
     canonicalRepo: string,
     options: {
       installed: boolean;
@@ -3323,8 +2684,8 @@ export class SkillFlowApp {
     },
   ): ImportGroupCandidate {
     const normalizedRepo = normalizeImportCanonicalRepo(canonicalRepo) ?? canonicalRepo;
-    const cachedRepo = importCache.repos?.[normalizedRepo];
-    const cachedSnapshot = cachedRepo?.providers.skills?.snapshot;
+    const cachedRepo = cachedSources[normalizedRepo];
+    const cachedSnapshot = cachedRepo?.data;
 
     if (cachedSnapshot) {
       return buildImportGroupCandidate({
@@ -3333,27 +2694,6 @@ export class SkillFlowApp {
         snapshot: cachedSnapshot,
         ...(options.matchedSkills ? { matchedSkills: options.matchedSkills } : {}),
       });
-    }
-
-    if (cachedRepo) {
-      return {
-        id: normalizedRepo,
-        provider: "skills",
-        locator: normalizedRepo,
-        canonicalRepo: normalizedRepo,
-        aliases: cachedRepo.identity.aliases,
-        title: cachedRepo.resolved.title ?? normalizedRepo.split("/")[1] ?? normalizedRepo,
-        installed: options.installed,
-        ...(cachedRepo.resolved.summary ? { summary: cachedRepo.resolved.summary } : {}),
-        ...(cachedRepo.resolved.sourceUrl ? { sourceUrl: cachedRepo.resolved.sourceUrl } : {}),
-        ...(cachedRepo.resolved.githubUrl ? { repoUrl: cachedRepo.resolved.githubUrl } : {}),
-        ...(cachedRepo.resolved.starCount !== undefined ? { starCount: cachedRepo.resolved.starCount } : {}),
-        ...(cachedRepo.resolved.downloadCount !== undefined ? { totalInstalls: cachedRepo.resolved.downloadCount } : {}),
-        ...(cachedRepo.resolved.skillCount !== undefined ? { skillCount: cachedRepo.resolved.skillCount } : {}),
-        ...(options.matchedSkills?.length ? { matchedSkillNames: options.matchedSkills.map((skill) => skill.title) } : {}),
-        ...(options.matchedSkills?.length ? { matchedSkills: options.matchedSkills } : {}),
-        enrichState: { status: "ready" },
-      };
     }
 
     return {
@@ -3375,7 +2715,7 @@ export class SkillFlowApp {
 
   private prewarmImportPreviewSnapshots(
     groups: ImportGroupCandidate[],
-    importCache: ImportDataCache,
+    cachedSources: ImportDataCache["repos"],
   ): void {
     let started = 0;
     for (const group of groups) {
@@ -3383,8 +2723,8 @@ export class SkillFlowApp {
         continue;
       }
       const normalizedRepo = normalizeImportCanonicalRepo(group.canonicalRepo) ?? group.canonicalRepo;
-      const cached = importCache.repos?.[normalizedRepo];
-      const cachedSnapshot = cached?.providers.skills?.snapshot;
+      const cached = cachedSources[normalizedRepo];
+      const cachedSnapshot = cached?.data;
       if (cached && cachedSnapshot && !isImportDataCacheExpired(cached)) {
         continue;
       }
@@ -3400,7 +2740,7 @@ export class SkillFlowApp {
     locator: string,
     manifest: ManifestFile,
   ): Promise<ImportGroupCandidate | null> {
-    const resolvedLocator = await this.resolveDirectImportLocator(locator);
+    const resolvedLocator = await this.importSourcePolicy.resolveDirectLocator(locator);
     if (!resolvedLocator) {
       return null;
     }
@@ -3440,168 +2780,14 @@ export class SkillFlowApp {
     return manifest.sources.some((source) => source.locator === locator);
   }
 
-  private async resolveRecommendedImportRepos(): Promise<string[]> {
-    const [seedGroups, officialGroups, hotGroups, trendingGroups] = await Promise.all([
-      this.resolveImportRecommendationFeed("seed"),
-      this.resolveImportRecommendationFeed("official"),
-      this.resolveImportRecommendationFeed("hot"),
-      this.resolveImportRecommendationFeed("trending"),
-    ]);
-
-    return [...new Set([
-      ...seedGroups,
-      ...officialGroups,
-      ...hotGroups,
-      ...trendingGroups,
-    ])];
-  }
-
-  private async resolveImportRecommendationFeed(
-    feedId: ImportRecommendationFeedId,
-  ): Promise<string[]> {
-    const cached = (await this.store.readImportDataCache()).recommendations[feedId];
-    if (cached) {
-      if (!isImportDataCacheExpired(cached)) {
-        return cached.groups;
-      }
-
-      this.refreshImportRecommendationFeedInBackground(feedId);
-      return cached.groups;
-    }
-
-    if (feedId === "seed") {
-      return (await this.refreshImportRecommendationFeedTracked(feedId)).groups;
-    }
-
-    this.refreshImportRecommendationFeedInBackground(feedId);
-    return [];
-  }
-
   private refreshImportRecommendationFeedInBackground(feedId: ImportRecommendationFeedId): void {
-    if (this.importRecommendationRefreshesByFeed.has(feedId)) {
-      return;
-    }
-
-    void this.refreshImportRecommendationFeedTracked(feedId).catch(() => undefined);
-  }
-
-  private async refreshImportRecommendationFeed(
-    feedId: ImportRecommendationFeedId,
-  ): Promise<ImportRecommendationFeed> {
-    const checkedAt = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + IMPORT_RECOMMENDATION_CACHE_TTL_MS).toISOString();
-    const groups = feedId === "seed"
-      ? this.importRecommendationSeedRepos()
-      : await fetchSkillsDirectoryFeedGroups(feedId);
-    const entry: ImportRecommendationFeed = { id: feedId, checkedAt, expiresAt, groups };
-    await this.store.writeImportRecommendationFeedEntry(entry);
-    return entry;
-  }
-
-  private async resolveImportSearchSnapshot(query: string): Promise<ImportSearchSnapshot> {
-    const normalizedQuery = query.trim().toLowerCase();
-    const cached = (await this.store.readImportDataCache()).searches[normalizedQuery];
-    if (cached) {
-      if (!isImportDataCacheExpired(cached)) {
-        return cached;
-      }
-
-      this.refreshImportSearchSnapshotInBackground(query);
-      return cached;
-    }
-
-    return this.refreshImportSearchSnapshotTracked(normalizedQuery, query);
-  }
-
-  private refreshImportSearchSnapshotInBackground(query: string): void {
-    const normalizedQuery = query.trim().toLowerCase();
-    void this.refreshImportSearchSnapshotTracked(normalizedQuery, query).catch(() => undefined);
-  }
-
-  private async refreshImportSearchSnapshot(query: string): Promise<ImportSearchSnapshot> {
-    const hits = await searchSkillsDirectory(query, 20);
-    const snapshot: ImportSearchSnapshot = {
-      query: query.trim(),
-      checkedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + IMPORT_SEARCH_CACHE_TTL_MS).toISOString(),
-      hits,
-      groups: [...new Set(hits.map((hit) => hit.canonicalRepo))],
-    };
-    await this.store.writeImportSearchSnapshotEntry(query.trim().toLowerCase(), snapshot);
-    return snapshot;
-  }
-
-  private async resolveImportSourceSnapshot(
-    canonicalRepo: string,
-    options?: {
-      enrichSkillIds?: string[];
-      includeSkillDetails?: boolean;
-      refreshTrustInBackground?: boolean;
-    },
-  ): Promise<UnifiedSourceSnapshot> {
-    const normalizedRepo = normalizeImportCanonicalRepo(canonicalRepo) ?? canonicalRepo;
-    const cached = (await this.store.readImportDataCache()).repos?.[normalizedRepo];
-    const cachedSnapshot = cached?.providers.skills?.snapshot;
-    const requiresSkillRefresh = cachedSnapshot
-      ? this.snapshotNeedsSkillRefresh(cachedSnapshot, options?.enrichSkillIds ?? [])
-      : false;
-
-    if (cached && cachedSnapshot) {
-      if (!isImportDataCacheExpired(cached) && !requiresSkillRefresh) {
-        return cachedSnapshot;
-      }
-
-      if (!requiresSkillRefresh) {
-        this.refreshImportSourceSnapshotInBackground(normalizedRepo);
-        return cachedSnapshot;
-      }
-    }
-
-    try {
-      const refreshOptions = {
-        ...(options?.enrichSkillIds ? { enrichSkillIds: options.enrichSkillIds } : {}),
-        ...(options?.includeSkillDetails !== undefined ? { includeSkillDetails: options.includeSkillDetails } : {}),
-        ...(options?.refreshTrustInBackground !== undefined ? { refreshTrustInBackground: options.refreshTrustInBackground } : {}),
-        ...(cachedSnapshot ? { cachedSnapshot } : {}),
-      };
-      return await this.refreshImportSourceSnapshotTracked(normalizedRepo, {
-        ...refreshOptions,
-      });
-    } catch (error) {
-      if (cachedSnapshot) {
-        return cachedSnapshot;
-      }
-      throw error;
-    }
-  }
-
-  private async resolveImportPreviewSnapshot(canonicalRepo: string): Promise<UnifiedSourceSnapshot> {
-    const normalizedRepo = normalizeImportCanonicalRepo(canonicalRepo) ?? canonicalRepo;
-    const cached = (await this.store.readImportDataCache()).repos?.[normalizedRepo];
-    const cachedSnapshot = cached?.providers.skills?.snapshot;
-
-    if (cached && cachedSnapshot && !isImportDataCacheExpired(cached)) {
-      return cachedSnapshot;
-    }
-
-    try {
-      return await this.refreshImportSourceSnapshotTracked(normalizedRepo, {
-        includeSkillDetails: false,
-        refreshTrustInBackground: false,
-        ...(cachedSnapshot ? { cachedSnapshot } : {}),
-      });
-    } catch (error) {
-      if (cachedSnapshot) {
-        return cachedSnapshot;
-      }
-      throw error;
-    }
+    void this.importDiscovery.refreshRecommendation(feedId).catch(() => undefined);
   }
 
   private async previewDirectImportSource(
     locator: string,
   ): Promise<Result<ImportPreviewResult> | null> {
-    const resolvedLocator = await this.resolveDirectImportLocator(locator);
+    const resolvedLocator = await this.importSourcePolicy.resolveDirectLocator(locator);
     if (!resolvedLocator) {
       return null;
     }
@@ -3749,140 +2935,18 @@ export class SkillFlowApp {
     return "git";
   }
 
-  private parseGitHubImportLocator(locator: string): GitHubImportLocator | undefined {
-    const trimmed = this.stripImportLocatorQuotes(locator.trim()).replace(/\/+$/, "");
-    const selectorLocator = this.parseGitHubImportSelectorLocator(trimmed);
-    if (selectorLocator) {
-      return selectorLocator;
-    }
-
-    const treeLocator = this.parseGitHubImportTreeLocator(trimmed);
-    if (treeLocator) {
-      return treeLocator;
-    }
-
-    const subpathLocator = this.parseGitHubImportShorthandSubpath(trimmed);
-    if (subpathLocator) {
-      return subpathLocator;
-    }
-
-    const canonicalRepo = normalizeImportCanonicalRepo(trimmed);
-    if (!canonicalRepo) {
-      return undefined;
-    }
-
-    return {
-      canonicalRepo,
-      originalLocator: canonicalRepo,
-      locator: canonicalRepo,
-    };
-  }
-
-  private parseGitHubImportSelectorLocator(locator: string): GitHubImportLocator | undefined {
-    const match = locator.match(/^([^/\s:@]+)\/([^/@\s]+)@(.+)$/);
-    const owner = match?.[1];
-    const rawRepo = match?.[2];
-    const skillSelector = match?.[3]?.trim().replace(/^\/+|\/+$/g, "");
-    if (!owner || !rawRepo || !skillSelector || skillSelector.includes("@")) {
-      return undefined;
-    }
-
-    return this.githubImportLocator(owner, rawRepo, locator, { skillSelector });
-  }
-
-  private parseGitHubImportTreeLocator(locator: string): GitHubImportLocator | undefined {
-    try {
-      const url = new URL(locator);
-      if (url.hostname !== "github.com") {
-        return undefined;
-      }
-
-      const parts = url.pathname.split("/").filter(Boolean);
-      if (parts.length < 2 || parts[2] && parts[2] !== "tree") {
-        return undefined;
-      }
-
-      const requestedPath = parts.length >= 5
-        ? parts.slice(4).join("/")
-        : undefined;
-      return this.githubImportLocator(parts[0], parts[1], locator, {
-        ...(requestedPath ? { requestedPath } : {}),
-      });
-    } catch {
-      return undefined;
-    }
-  }
-
-  private parseGitHubImportShorthandSubpath(locator: string): GitHubImportLocator | undefined {
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(locator) || locator.startsWith("git@")) {
-      return undefined;
-    }
-
-    const parts = locator.split("/");
-    if (parts.length < 3) {
-      return undefined;
-    }
-
-    const requestedPath = parts.slice(2).join("/");
-    if (!requestedPath) {
-      return undefined;
-    }
-
-    return this.githubImportLocator(parts[0], parts[1], locator, { requestedPath });
-  }
-
-  private githubImportLocator(
-    owner: string | undefined,
-    rawRepo: string | undefined,
-    originalLocator: string,
-    options: {
-      requestedPath?: string;
-      skillSelector?: string;
-    } = {},
-  ): GitHubImportLocator | undefined {
-    if (!owner || !rawRepo) {
-      return undefined;
-    }
-    const repo = rawRepo.replace(/\.git$/i, "");
-    const canonicalRepo = normalizeImportCanonicalRepo(`${owner}/${repo}`);
-    if (!canonicalRepo) {
-      return undefined;
-    }
-
-    return {
-      canonicalRepo,
-      originalLocator,
-      locator: `https://github.com/${canonicalRepo}.git`,
-      ...(options.requestedPath ? { requestedPath: options.requestedPath } : {}),
-      ...(options.skillSelector ? { skillSelector: options.skillSelector } : {}),
-    };
-  }
-
-  private importLocatorMatchedSkillNames(locator: GitHubImportLocator): string[] {
-    if (locator.skillSelector) {
-      return [locator.skillSelector];
-    }
-
-    const basename = locator.requestedPath
-      ?.split("/")
-      .filter(Boolean)
-      .at(-1);
-    return basename ? [basename] : [];
-  }
-
   private filterImportSnapshotSkills(
     skills: UnifiedSourceSnapshot["skills"],
     selector: string,
     canonicalRepo: string,
   ): UnifiedSourceSnapshot["skills"] {
-    const selectorVariants = this.buildImportSkillSelectorVariants(selector, canonicalRepo);
-    return skills.filter((skill) => {
-      const skillVariants = new Set([
-        ...this.buildImportSkillSelectorVariants(skill.skillId, canonicalRepo),
-        ...this.buildImportSkillSelectorVariants(skill.title, canonicalRepo),
-      ]);
-      return selectorVariants.some((variant) => skillVariants.has(variant));
-    });
+    return skills.filter((skill) =>
+      this.importSourcePolicy.matchesSelector(
+        selector,
+        [skill.skillId, skill.title],
+        canonicalRepo,
+      )
+    );
   }
 
   private filterPreviewLeafs<T extends SelectableLeaf>(
@@ -3894,7 +2958,7 @@ export class SkillFlowApp {
     } = {},
   ): T[] | undefined {
     let filteredLeafs = leafs;
-    const requestedPath = this.normalizeRequestedPath(options.requestedPath);
+    const requestedPath = this.importSourcePolicy.normalizeRequestedPath(options.requestedPath);
     if (requestedPath) {
       filteredLeafs = filteredLeafs.filter(
         (leaf) => leaf.relativePath === requestedPath || leaf.relativePath.startsWith(`${requestedPath}/`),
@@ -3922,34 +2986,6 @@ export class SkillFlowApp {
     return filteredLeafs.filter((leaf) => selected.has(leaf.id));
   }
 
-  private async resolveDirectImportLocator(locator: string): Promise<string | undefined> {
-    const trimmed = this.stripImportLocatorQuotes(locator.trim());
-    if (!trimmed || normalizeImportCanonicalRepo(trimmed)) {
-      return undefined;
-    }
-
-    if (/^clawhub:[^@\s]+(?:@.+)?$/i.test(trimmed)) {
-      return trimmed;
-    }
-
-    const hostedRepo = parseHostedGitRepo(trimmed);
-    if (hostedRepo?.host.includes("gitlab")) {
-      return trimmed;
-    }
-
-    const localLocator = trimmed.startsWith("~/")
-      ? path.join(process.env.HOME ?? os.homedir(), trimmed.slice(2))
-      : trimmed;
-    const resolvedPath = path.resolve(localLocator.startsWith("file://")
-      ? decodeURIComponent(new URL(trimmed).pathname)
-      : localLocator);
-    if (await pathExists(resolvedPath)) {
-      return resolvedPath;
-    }
-
-    return undefined;
-  }
-
   private stripImportLocatorQuotes(locator: string): string {
     if (locator.length < 2) {
       return locator;
@@ -3965,290 +3001,7 @@ export class SkillFlowApp {
   }
 
   private refreshImportSourceSnapshotInBackground(canonicalRepo: string): void {
-    const refreshKey = this.importSourceRefreshKey(canonicalRepo);
-    if (this.importSourceRefreshesByKey.has(refreshKey)) {
-      return;
-    }
-
-    void this.refreshImportSourceSnapshotTracked(canonicalRepo).catch(() => undefined);
-  }
-
-  private refreshImportRecommendationFeedTracked(
-    feedId: ImportRecommendationFeedId,
-  ): Promise<ImportRecommendationFeed> {
-    const inFlight = this.importRecommendationRefreshesByFeed.get(feedId);
-    if (inFlight) {
-      return inFlight;
-    }
-
-    const refresh = this.refreshImportRecommendationFeed(feedId).finally(() => {
-      this.importRecommendationRefreshesByFeed.delete(feedId);
-    });
-    this.importRecommendationRefreshesByFeed.set(feedId, refresh);
-    return refresh;
-  }
-
-  private refreshImportSearchSnapshotTracked(
-    normalizedQuery: string,
-    query: string,
-  ): Promise<ImportSearchSnapshot> {
-    const inFlight = this.importSearchRefreshesByQuery.get(normalizedQuery);
-    if (inFlight) {
-      return inFlight;
-    }
-
-    const refresh = this.refreshImportSearchSnapshot(query).finally(() => {
-      this.importSearchRefreshesByQuery.delete(normalizedQuery);
-    });
-    this.importSearchRefreshesByQuery.set(normalizedQuery, refresh);
-    return refresh;
-  }
-
-  private refreshImportSourceSnapshotTracked(
-    canonicalRepo: string,
-    options?: {
-      enrichSkillIds?: string[];
-      includeSkillDetails?: boolean;
-      refreshTrustInBackground?: boolean;
-      cachedSnapshot?: UnifiedSourceSnapshot;
-    },
-  ): Promise<UnifiedSourceSnapshot> {
-    const refreshKey = this.importSourceRefreshKey(canonicalRepo, options?.enrichSkillIds);
-    const inFlight = this.importSourceRefreshesByKey.get(refreshKey);
-    if (inFlight) {
-      return inFlight;
-    }
-
-    const refresh = this.refreshImportSourceSnapshot(canonicalRepo, options).finally(() => {
-      this.importSourceRefreshesByKey.delete(refreshKey);
-    });
-    this.importSourceRefreshesByKey.set(refreshKey, refresh);
-    return refresh;
-  }
-
-  private async refreshImportSourceSnapshot(
-    canonicalRepo: string,
-    options?: {
-      enrichSkillIds?: string[];
-      includeSkillDetails?: boolean;
-      refreshTrustInBackground?: boolean;
-      cachedSnapshot?: UnifiedSourceSnapshot;
-    },
-  ): Promise<UnifiedSourceSnapshot> {
-    const includeSkillDetails = options?.includeSkillDetails !== undefined
-      ? options.includeSkillDetails
-      : (options?.enrichSkillIds?.length ?? 0) > 0;
-    const trust = await this.resolveCachedImportSourceTrust(canonicalRepo, {
-      refreshInBackground: options?.refreshTrustInBackground ?? includeSkillDetails,
-    });
-
-    const snapshot = await fetchSkillsDirectorySourceSnapshot(canonicalRepo, {
-      includeSkillDetails,
-      ...(options?.enrichSkillIds ? { enrichSkillIds: options.enrichSkillIds } : {}),
-      ...(this.hasUnifiedSourceTrust(trust) ? { trust } : {}),
-    });
-    const mergedSnapshot = options?.cachedSnapshot
-      ? this.mergeSourceSnapshots(options.cachedSnapshot, snapshot)
-      : snapshot;
-    await this.store.writeImportSourceSnapshotEntry({
-      canonicalRepo,
-      checkedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + IMPORT_SOURCE_CACHE_TTL_MS).toISOString(),
-      data: mergedSnapshot,
-    });
-    return mergedSnapshot;
-  }
-
-  private async resolveCachedImportSourceTrust(
-    canonicalRepo: string,
-    options?: { refreshInBackground?: boolean },
-  ): Promise<UnifiedSourceTrust> {
-    const recommendations = (await this.store.readImportDataCache()).recommendations;
-    const trust: UnifiedSourceTrust = {};
-
-    for (const feedId of ["official", "trending", "hot", "audits"] as const) {
-      const cachedFeed = recommendations[feedId];
-      if (cachedFeed && !isImportDataCacheExpired(cachedFeed)) {
-        if (cachedFeed.groups.includes(canonicalRepo)) {
-          if (feedId === "official") {
-            trust.official = true;
-          } else if (feedId === "trending") {
-            trust.trending = true;
-          } else if (feedId === "hot") {
-            trust.hot = true;
-          } else if (feedId === "audits") {
-            trust.audited = true;
-          }
-        }
-        continue;
-      }
-
-      if (options?.refreshInBackground !== false) {
-        this.refreshImportRecommendationFeedInBackground(feedId);
-      }
-    }
-
-    return trust;
-  }
-
-  private snapshotNeedsSkillRefresh(
-    snapshot: UnifiedSourceSnapshot,
-    skillIds: string[],
-  ): boolean {
-    if (skillIds.length === 0) {
-      return false;
-    }
-
-    return skillIds.some((skillId) => {
-      const skill = snapshot.skills.find((item) => item.skillId === skillId);
-      if (!skill) {
-        return true;
-      }
-      return !skill.summary &&
-        skill.weeklyInstalls === undefined &&
-        !skill.firstSeen &&
-        !skill.installedOn?.length &&
-        !skill.audits;
-    });
-  }
-
-  private mergeSourceSnapshots(
-    previous: UnifiedSourceSnapshot,
-    next: UnifiedSourceSnapshot,
-  ): UnifiedSourceSnapshot {
-    const previousSkillsById = new Map(previous.skills.map((skill) => [skill.skillId, skill]));
-    const mergedSkills = next.skills.map((skill) => {
-      const previousSkill = previousSkillsById.get(skill.skillId);
-      return previousSkill
-        ? {
-            ...previousSkill,
-            ...skill,
-            ...(skill.installedOn?.length ? { installedOn: skill.installedOn } : previousSkill.installedOn ? { installedOn: previousSkill.installedOn } : {}),
-            ...(skill.audits ? { audits: skill.audits } : previousSkill.audits ? { audits: previousSkill.audits } : {}),
-          }
-        : skill;
-    });
-
-    return {
-      ...previous,
-      ...next,
-      owner: {
-        ...previous.owner,
-        ...next.owner,
-      },
-      skills: mergedSkills,
-      trust: {
-        ...(previous.trust ?? {}),
-        ...(next.trust ?? {}),
-      },
-    };
-  }
-
-  private buildImportSkillSelectorVariants(
-    value: string,
-    canonicalRepo: string,
-  ): string[] {
-    const normalized = this.normalizeImportSkillSelector(value);
-    if (!normalized) {
-      return [];
-    }
-
-    const repo = parseGitHubRepo(canonicalRepo);
-    const variants = new Set<string>([normalized]);
-    const prefixes = new Set<string>();
-    const pathSegments = value
-      .trim()
-      .replace(/\\/g, "/")
-      .split("/")
-      .map((segment) => segment.trim())
-      .filter(Boolean);
-
-    if (pathSegments.length > 1) {
-      for (let index = 1; index < pathSegments.length; index += 1) {
-        const suffix = this.normalizeImportSkillSelector(pathSegments.slice(index).join("/"));
-        if (suffix) {
-          variants.add(suffix);
-        }
-      }
-    }
-
-    if (repo) {
-      const normalizedOwner = this.normalizeImportSkillSelector(repo.owner);
-      const ownerHead = this.normalizeImportSkillSelector(repo.owner.split(/[^a-z0-9]+/i)[0] ?? "");
-      const normalizedRepo = this.normalizeImportSkillSelector(repo.repo);
-
-      if (normalizedOwner) {
-        prefixes.add(normalizedOwner);
-      }
-      if (ownerHead) {
-        prefixes.add(ownerHead);
-      }
-      if (normalizedRepo) {
-        prefixes.add(normalizedRepo);
-      }
-    }
-
-    for (const prefix of prefixes) {
-      if (normalized.startsWith(`${prefix}-`)) {
-        variants.add(normalized.slice(prefix.length + 1));
-      }
-    }
-
-    return [...variants];
-  }
-
-  private normalizeImportSkillSelector(value: string): string {
-    return value
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .replace(/-+/g, "-");
-  }
-
-  private getImportLeafSelectorRank(relativePath: string): number {
-    if (relativePath === ".") {
-      return 0;
-    }
-    if (/^skills\/[^/]+$/.test(relativePath)) {
-      return 1;
-    }
-    if (/^skills\/\.(curated|experimental|system)\/[^/]+$/.test(relativePath)) {
-      return 2;
-    }
-    return 3;
-  }
-
-  private pickPreferredImportLeafMatch<T extends SelectableLeaf>(matches: T[]): T | undefined {
-    if (matches.length === 0) {
-      return undefined;
-    }
-
-    const ranked = matches.map((leaf) => ({
-      leaf,
-      rank: this.getImportLeafSelectorRank(leaf.relativePath),
-    }));
-    const bestRank = Math.min(...ranked.map((entry) => entry.rank));
-    const bestMatches = ranked
-      .filter((entry) => entry.rank === bestRank)
-      .map((entry) => entry.leaf);
-
-    return bestMatches.length === 1 ? bestMatches[0] : undefined;
-  }
-
-  private importSourceRefreshKey(canonicalRepo: string, enrichSkillIds?: string[]): string {
-    const normalizedSkillIds = [...new Set((enrichSkillIds ?? []).filter(Boolean))].sort();
-    if (normalizedSkillIds.length === 0) {
-      return canonicalRepo;
-    }
-    return `${canonicalRepo}::${normalizedSkillIds.join(",")}`;
-  }
-
-  private hasUnifiedSourceTrust(trust: UnifiedSourceTrust): boolean {
-    return trust.official === true ||
-      trust.trending === true ||
-      trust.hot === true ||
-      trust.audited === true;
+    void this.importDiscovery.refreshSource(canonicalRepo).catch(() => undefined);
   }
 
   private async mapConcurrent<T, R>(
@@ -4379,11 +3132,8 @@ export class SkillFlowApp {
   ): Promise<
     Result<{
       availableTargets: DeploymentTargetId[];
-      manifest: ManifestFile;
-      lockFile: LockFile;
       summaries: WorkflowSummary[];
       initialDrafts: Record<string, DraftBinding>;
-      audit: DoctorReport;
       importedSourceIds: string[];
       pinnedSourceIds: string[];
       recentProjects: RecentProject[];
@@ -4419,11 +3169,8 @@ export class SkillFlowApp {
   ): Promise<
     Result<{
       availableTargets: DeploymentTargetId[];
-      manifest: ManifestFile;
-      lockFile: LockFile;
       summaries: WorkflowSummary[];
       initialDrafts: Record<string, DraftBinding>;
-      audit: DoctorReport;
       importedSourceIds: string[];
       pinnedSourceIds: string[];
       recentProjects: RecentProject[];
@@ -4444,17 +3191,10 @@ export class SkillFlowApp {
       boot.data.manifest,
       boot.data.lockFile,
     );
-    if (process.env.VITEST !== "true") {
-      void this.refreshUsageObservations({ trigger: "bootstrap" }).catch(() => undefined);
-    }
-
     return ok({
       availableTargets: boot.data.availableTargets,
-      manifest: boot.data.manifest,
-      lockFile: boot.data.lockFile,
       summaries: boot.data.summaries,
       initialDrafts: boot.data.initialDrafts,
-      audit: boot.data.audit,
       importedSourceIds: [],
       pinnedSourceIds: preferences.pinnedSourceIds,
       recentProjects: preferences.recentProjects,
@@ -4495,7 +3235,7 @@ export class SkillFlowApp {
         return normalizeImportCanonicalRepo(locator);
       }, undefined);
       const cachedSnapshot = canonicalRepo
-        ? importDataCache.repos?.[canonicalRepo]?.providers.skills?.snapshot
+        ? importDataCache.repos?.[canonicalRepo]?.data
         : undefined;
       if (cachedSnapshot) {
         entry.sourceSnapshot = cachedSnapshot;
@@ -4864,7 +3604,7 @@ export class SkillFlowApp {
     sourceId: string,
     draft: DraftBinding,
     scope: ProjectScope,
-    options: { recoverable?: boolean } = {},
+    transaction?: OperationRecoveryTransaction,
   ): Promise<Result<ApplyDraftResult>> {
     if (scope.kind === "project") {
       const runtimeView = await this.readRuntimeAuthorityView();
@@ -5019,8 +3759,8 @@ export class SkillFlowApp {
       lockFile,
       sourceId,
       preferences,
-      options.recoverable
-        ? (actions) => this.operationRecoveryService.prepareTargetMutations(actions)
+      transaction
+        ? (actions) => transaction.prepareTargetMutations(actions)
         : undefined,
     );
     if (!reconciled.ok) {
@@ -5311,9 +4051,9 @@ export class SkillFlowApp {
   }
 
   private async updateSourcesImpl(sourceIds?: string[]): Promise<Result<SourceUpdateResult>> {
-    const preflight = await this.sourceAuthorityService.preflightUpdateSources(sourceIds);
-    if (!preflight.ok) {
-      return fail(preflight.errors, preflight.warnings);
+    const precheck = await this.sourceAuthorityService.precheckUpdateSources(sourceIds);
+    if (!precheck.ok) {
+      return fail(precheck.errors, precheck.warnings);
     }
     const initialState = await this.stateStore.readState();
     const requestedIds = sourceIds?.length
@@ -5328,19 +4068,26 @@ export class SkillFlowApp {
         .map((source) => source.id);
     const updatedItems: SourceUpdateResultItem[] = [];
     const failed: NonNullable<SourceUpdateResult["failed"]> = [];
-    const warnings: Warning[] = [...preflight.warnings];
-    const precheckFallbackSourceIds: string[] = [];
+    const warnings: Warning[] = [...precheck.warnings];
+    const precheckFallbackSourceIds: string[] = [...precheck.data.precheckFallbackSourceIds];
+    const unchangedBySourceId = new Map(
+      precheck.data.unchanged.map((item) => [item.sourceId, item]),
+    );
+    const skipRemotePrecheckSourceIds = new Set([
+      ...precheck.data.remoteChangedSourceIds,
+      ...precheck.data.precheckFallbackSourceIds,
+    ]);
     const hardErrors: Array<{ code: string; message: string }> = [];
     const recordFailureAndRecover = async (
       sourceId: string,
       failureErrors: Array<{ code: string; message: string }>,
       fallback: { code: string; message: string },
-      shouldRecover: boolean,
+      transaction: OperationRecoveryTransaction | undefined,
     ): Promise<Result<void>> => {
       const primary = failureErrors[0] ?? fallback;
       hardErrors.push(...(failureErrors.length > 0 ? failureErrors : [fallback]));
       failed.push({ sourceId, code: primary.code, message: primary.message });
-      if (!shouldRecover) return ok(undefined);
+      if (!transaction) return ok(undefined);
       const recovered = await this.recoverInterruptedOperation();
       if (!recovered.ok) return fail(recovered.errors, recovered.warnings);
       warnings.push(...recovered.warnings);
@@ -5348,6 +4095,11 @@ export class SkillFlowApp {
     };
 
     for (const sourceId of requestedIds) {
+      const unchanged = unchangedBySourceId.get(sourceId);
+      if (unchanged) {
+        updatedItems.push(unchanged);
+        continue;
+      }
       const currentState = await this.stateStore.readState();
       const source = currentState.manifest.sources.find((candidate) => candidate.id === sourceId);
       const lock = currentState.lockFile.sources[sourceId];
@@ -5356,7 +4108,7 @@ export class SkillFlowApp {
         && source.kind !== "collection"
         && source.ownership !== "external"
         && lock.ownership !== "external";
-      let transaction: { checkoutBackupPath: string } | undefined;
+      let transaction: OperationRecoveryTransaction | undefined;
       try {
         if (managed) {
           transaction = await this.operationRecoveryService.begin({
@@ -5366,6 +4118,7 @@ export class SkillFlowApp {
           });
         }
         const updated = await this.sourceAuthorityService.updateSources([sourceId], {
+          ...(skipRemotePrecheckSourceIds.has(sourceId) ? { skipGitRemotePrecheck: true } : {}),
           ...(transaction
             ? { checkoutBackupPath: transaction.checkoutBackupPath, retainCheckoutBackup: true }
             : {}),
@@ -5375,13 +4128,21 @@ export class SkillFlowApp {
           const handled = await recordFailureAndRecover(sourceId, updated.errors, {
             code: "SOURCE_UPDATE_FAILED",
             message: `Unable to update skills group '${sourceId}'.`,
-          }, transaction !== undefined);
+          }, transaction);
           if (!handled.ok) return fail(handled.errors, handled.warnings);
           continue;
         }
 
         precheckFallbackSourceIds.push(...(updated.data.precheckFallbackSourceIds ?? []));
         if (!transaction) {
+          updatedItems.push(...updated.data.updated);
+          continue;
+        }
+
+        const sourceUpdate = updated.data.updated.find((item) => item.sourceId === sourceId);
+        if (sourceUpdate && !sourceUpdate.changed && !sourceUpdate.repaired) {
+          await transaction.checkpoint();
+          await transaction.commit();
           updatedItems.push(...updated.data.updated);
           continue;
         }
@@ -5413,11 +4174,11 @@ export class SkillFlowApp {
           const handled = await recordFailureAndRecover(sourceId, planned.errors, {
             code: "DEPLOYMENT_PLAN_FAILED",
             message: `Unable to plan deployment for '${sourceId}'.`,
-          }, true);
+          }, transaction);
           if (!handled.ok) return fail(handled.errors, handled.warnings);
           continue;
         }
-        await this.operationRecoveryService.prepareTargetMutations(planned.data.actions);
+        await transaction.prepareTargetMutations(planned.data.actions);
         const applied = await this.deploymentReconciler.apply({
           lockFile,
           actions: planned.data.actions,
@@ -5428,20 +4189,20 @@ export class SkillFlowApp {
           const handled = await recordFailureAndRecover(sourceId, applied.errors, {
             code: "DEPLOYMENT_APPLY_FAILED",
             message: `Unable to apply deployment for '${sourceId}'.`,
-          }, true);
+          }, transaction);
           if (!handled.ok) return fail(handled.errors, handled.warnings);
           continue;
         }
         await this.stateStore.writeState({ ...state, manifest, lockFile });
-        await this.operationRecoveryService.checkpoint();
-        await this.operationRecoveryService.commit();
+        await transaction.checkpoint();
+        await transaction.commit();
         updatedItems.push(...updated.data.updated);
       } catch (error) {
         const failure = {
           code: "SOURCE_UPDATE_FAILED",
           message: `Unable to update skills group '${sourceId}': ${String(error)}`,
         };
-        const handled = await recordFailureAndRecover(sourceId, [failure], failure, transaction !== undefined);
+        const handled = await recordFailureAndRecover(sourceId, [failure], failure, transaction);
         if (!handled.ok) return fail(handled.errors, handled.warnings);
       }
     }
@@ -5951,21 +4712,6 @@ export class SkillFlowApp {
     );
   }
 
-  bindingFromDraft(draft: DraftBinding): SourceBindingSummary {
-    const targets: SourceBindingSummary["targets"] = {};
-    for (const target of draft.enabledTargets) {
-      targets[target] = {
-        enabled: true,
-        leafIds: [...draft.selectedLeafIds],
-      };
-    }
-    return {
-      selectedLeafIds: [...draft.selectedLeafIds],
-      resolvedSelectedLeafCount: draft.selectedLeafIds.length,
-      targets,
-    };
-  }
-
   private uniqueCollectionSourceId(
     displayName: string,
     manifest: ManifestFile,
@@ -6217,35 +4963,6 @@ export class SkillFlowApp {
         ),
       ]),
     );
-  }
-
-  private cloneManifest(manifest: RuntimeManifestView): RuntimeManifestView {
-    const bindings: Record<string, SourceBindingSummary> = {};
-
-    for (const [sourceId, binding] of Object.entries(manifest.bindings)) {
-      const targets: SourceBindingSummary["targets"] = {};
-      for (const [target, targetBinding] of Object.entries(binding.targets)) {
-        if (!targetBinding) {
-          continue;
-        }
-        targets[target as DeploymentTargetName] = {
-          enabled: targetBinding.enabled,
-          leafIds: [...targetBinding.leafIds],
-        };
-      }
-
-      bindings[sourceId] = {
-        selectedLeafIds: [...binding.selectedLeafIds],
-        resolvedSelectedLeafCount: binding.resolvedSelectedLeafCount ?? binding.selectedLeafIds.length,
-        targets,
-      };
-    }
-
-    return {
-      schemaVersion: manifest.schemaVersion,
-      sources: manifest.sources.map((source) => ({ ...source })),
-      bindings,
-    };
   }
 
   private cloneAuthorityManifest(manifest: ManifestFile): ManifestFile {
@@ -6554,50 +5271,6 @@ export class SkillFlowApp {
     }
   }
 
-  private normalizeBindings(
-    manifest: RuntimeManifestView,
-    lockFile: LockFile,
-    collections?: CollectionsFile,
-  ): boolean {
-    let changed = false;
-
-    for (const source of manifest.sources) {
-      const currentBinding = manifest.bindings[source.id] ?? {
-        selectedLeafIds: [],
-        resolvedSelectedLeafCount: 0,
-        targets: {},
-      };
-      const normalizedDraft = this.draftFromSourceBinding(source, currentBinding, lockFile, collections);
-      const normalizedBinding = this.bindingFromDraft(normalizedDraft);
-
-      if (JSON.stringify(currentBinding) === JSON.stringify(normalizedBinding)) {
-        continue;
-      }
-
-      manifest.bindings[source.id] = normalizedBinding;
-      changed = true;
-    }
-
-    return changed;
-  }
-
-  private draftFromSourceBinding(
-    source: RuntimeManifestView["sources"][number],
-    binding: SourceBindingSummary,
-    lockFile: LockFile,
-    collections?: CollectionsFile,
-  ): DraftBinding {
-    const leafIds = source.kind === "collection"
-      ? this.getCollectionSourceAllowedLeafIds(source.id, binding, lockFile, collections)
-      : new Set(
-          lockFile.leafInventory
-            .filter((leaf) => leaf.sourceId === source.id)
-            .map((leaf) => leaf.id),
-        );
-
-    return this.draftFromBindingAllowedLeafIds(binding, leafIds);
-  }
-
   private draftFromBinding(
     sourceId: string,
     binding: SourceBindingSummary,
@@ -6635,88 +5308,6 @@ export class SkillFlowApp {
       enabledTargets,
       selectedLeafIds,
     };
-  }
-
-  private getCollectionSourceAllowedLeafIds(
-    sourceId: string,
-    binding: SourceBindingSummary,
-    lockFile: LockFile,
-    collections?: CollectionsFile,
-  ): Set<string> {
-    const existingLeafIds = new Set(lockFile.leafInventory.map((leaf) => leaf.id));
-    const collectionLeafIds = collections?.collections[sourceId]?.members
-      .map((member) => member.snapshot.leafId)
-      .filter((leafId) => existingLeafIds.has(leafId));
-
-    if (collectionLeafIds) {
-      return new Set(collectionLeafIds);
-    }
-
-    return new Set(
-      [
-        ...(binding.selectedLeafIds ?? []),
-        ...Object.values(binding.targets).flatMap((targetBinding) => targetBinding?.leafIds ?? []),
-      ].filter((leafId) => existingLeafIds.has(leafId)),
-    );
-  }
-
-  private getSourceLeafsForBinding(
-    source: RuntimeManifestView["sources"][number],
-    binding: SourceBindingSummary,
-    lockFile: LockFile,
-    collections?: CollectionsFile,
-  ): LeafRecord[] {
-    if (source.kind !== "collection") {
-      return lockFile.leafInventory.filter((leaf) => leaf.sourceId === source.id);
-    }
-
-    const leafsById = new Map(lockFile.leafInventory.map((leaf) => [leaf.id, leaf]));
-    const collection = collections?.collections[source.id];
-    if (collection) {
-      return collection.members
-        .map((member) => leafsById.get(member.snapshot.leafId))
-        .filter((leaf): leaf is LeafRecord => Boolean(leaf));
-    }
-
-    return ([
-      ...new Set([
-        ...(binding.selectedLeafIds ?? []),
-        ...Object.values(binding.targets).flatMap((targetBinding) => targetBinding?.leafIds ?? []),
-      ]),
-    ])
-      .map((leafId) => leafsById.get(leafId))
-      .filter((leaf): leaf is LeafRecord => Boolean(leaf));
-  }
-
-  private findLeafForSourceBinding(
-    source: RuntimeManifestView["sources"][number],
-    binding: SourceBindingSummary,
-    lockFile: LockFile,
-    leafId: string,
-  ): LeafRecord | undefined {
-    if (source.kind !== "collection") {
-      return lockFile.leafInventory.find((leaf) => leaf.sourceId === source.id && leaf.id === leafId);
-    }
-
-    return this.getSourceLeafsForBinding(source, binding, lockFile).find((leaf) => leaf.id === leafId);
-  }
-
-  private selectLeafIdsForRequestedPath(
-    leafs: SelectableLeaf[],
-    requestedPath?: string,
-  ): string[] {
-    const normalizedPath = this.normalizeRequestedPath(requestedPath);
-    if (!normalizedPath) {
-      return leafs.map((leaf) => leaf.id);
-    }
-
-    return leafs
-      .filter(
-        (leaf) =>
-          leaf.relativePath === normalizedPath ||
-          leaf.relativePath.startsWith(`${normalizedPath}/`),
-      )
-      .map((leaf) => leaf.id);
   }
 
   private buildAddDraft(
@@ -6856,7 +5447,7 @@ export class SkillFlowApp {
       }
       if (fallbackMatches.length > 1) {
         if (canonicalRepo) {
-          const preferred = this.pickPreferredImportLeafMatch(fallbackMatches);
+          const preferred = this.importSourcePolicy.pickPreferredLeaf(fallbackMatches);
           if (preferred) {
             matchedLeafIds.push(preferred.id);
             continue;
@@ -6900,25 +5491,7 @@ export class SkillFlowApp {
     selectorPath: string,
     canonicalRepo: string | undefined,
   ): SelectableLeaf[] {
-    return sourceLeafs.filter((leaf) => {
-      if (leaf.linkName === selectorPath || leaf.title === selectorPath || leaf.name === selectorPath) {
-        return true;
-      }
-
-      if (!canonicalRepo) {
-        return false;
-      }
-
-      const selectorVariants = this.buildImportSkillSelectorVariants(selectorPath, canonicalRepo);
-      const leafVariants = new Set([
-        ...this.buildImportSkillSelectorVariants(leaf.linkName, canonicalRepo),
-        ...this.buildImportSkillSelectorVariants(leaf.title, canonicalRepo),
-        ...(leaf.name ? this.buildImportSkillSelectorVariants(leaf.name, canonicalRepo) : []),
-        ...this.buildImportSkillSelectorVariants(path.posix.basename(leaf.relativePath), canonicalRepo),
-      ]);
-
-      return selectorVariants.some((variant) => leafVariants.has(variant));
-    });
+    return this.importSourcePolicy.findSelectorMatches(sourceLeafs, selectorPath, canonicalRepo);
   }
 
   private resolveSelectedLeafIds(
@@ -6928,7 +5501,7 @@ export class SkillFlowApp {
     canonicalRepo?: string,
   ): Result<string[]> {
     if (!skillNames || skillNames.length === 0) {
-      return ok(this.selectLeafIdsForRequestedPath(sourceLeafs, requestedPath));
+      return ok(this.importSourcePolicy.selectLeafIdsForRequestedPath(sourceLeafs, requestedPath));
     }
 
     const requested = [...new Set(skillNames.map((skillName) => skillName.trim()).filter(Boolean))];
@@ -6947,36 +5520,18 @@ export class SkillFlowApp {
         });
       }
 
-      const fallbackMatches = sourceLeafs.filter((leaf) => {
-        if (leaf.linkName === selector || leaf.title === selector || leaf.name === selector) {
-          return true;
-        }
-
-        if (!canonicalRepo) {
-          return false;
-        }
-
-        // skills.sh can prefix repo skill ids, for example `vercel-react-best-practices`,
-        // while the GitHub checkout still uses the real directory name `react-best-practices`.
-        // Keep the preview data unchanged for the UI, but accept those prefixed ids here so
-        // the actual import still resolves against the GitHub checkout.
-        const selectorVariants = this.buildImportSkillSelectorVariants(selector, canonicalRepo);
-        const leafVariants = new Set([
-          ...this.buildImportSkillSelectorVariants(leaf.linkName, canonicalRepo),
-          ...this.buildImportSkillSelectorVariants(leaf.title, canonicalRepo),
-          ...(leaf.name ? this.buildImportSkillSelectorVariants(leaf.name, canonicalRepo) : []),
-          ...this.buildImportSkillSelectorVariants(path.posix.basename(leaf.relativePath), canonicalRepo),
-        ]);
-
-        return selectorVariants.some((variant) => leafVariants.has(variant));
-      });
+      const fallbackMatches = this.importSourcePolicy.findSelectorMatches(
+        sourceLeafs,
+        selector,
+        canonicalRepo,
+      );
       if (fallbackMatches.length === 1) {
         matchedLeafIds.push(fallbackMatches[0]!.id);
         continue;
       }
       if (fallbackMatches.length > 1) {
         if (canonicalRepo) {
-          const preferred = this.pickPreferredImportLeafMatch(fallbackMatches);
+          const preferred = this.importSourcePolicy.pickPreferredLeaf(fallbackMatches);
           if (preferred) {
             matchedLeafIds.push(preferred.id);
             continue;
@@ -7020,15 +5575,6 @@ export class SkillFlowApp {
     return ok([...new Set(requestedTargets)]);
   }
 
-  private normalizeRequestedPath(requestedPath?: string): string | undefined {
-    if (!requestedPath) {
-      return undefined;
-    }
-
-    const normalized = requestedPath.trim().replace(/^\.\/+/, "").replace(/\/+$/, "");
-    return normalized.length > 0 && normalized !== "." ? normalized : undefined;
-  }
-
   private async rollbackPreparedSourceInternal(
     sourceId: string,
   ): Promise<Result<{ removed: string[] }>> {
@@ -7050,46 +5596,6 @@ export class SkillFlowApp {
     }
 
     return this.sourceAuthorityService.removeSource([sourceId]);
-  }
-
-  private prepareManifestForDraft(
-    manifest: RuntimeManifestView,
-    lockFile: LockFile,
-    sourceId: string,
-    draft: DraftBinding,
-  ): { manifest: RuntimeManifestView; draft: DraftBinding; warnings: Warning[] } {
-    manifest.bindings[sourceId] = this.bindingFromDraft(draft);
-    const source = manifest.sources.find((item) => item.id === sourceId);
-    if (source) {
-      const sourceLeafCount = lockFile.leafInventory.filter((leaf) => leaf.sourceId === sourceId).length;
-      source.selectionMode =
-        draft.selectedLeafIds.length >= sourceLeafCount && sourceLeafCount > 0
-          ? "all"
-          : "selected";
-    }
-
-    const conflictingLeafIds = this.findExactDuplicateLeafSelections(
-      manifest,
-      lockFile,
-      sourceId,
-      draft.enabledTargets,
-    );
-    const normalizedDraft: DraftBinding = {
-      enabledTargets: [...draft.enabledTargets],
-      selectedLeafIds: draft.selectedLeafIds.filter((leafId) => !conflictingLeafIds.has(leafId)),
-    };
-    manifest.bindings[sourceId] = this.bindingFromDraft(normalizedDraft);
-
-    const warnings = [...conflictingLeafIds].map((leafId) => ({
-      code: "DUPLICATE_LEAF_SELECTION_SKIPPED",
-      message: `${lockFile.leafInventory.find((leaf) => leaf.id === leafId)?.linkName ?? leafId} skipped because an identical skill is already selected in another skills group.`,
-    }));
-
-    return {
-      manifest,
-      draft: normalizedDraft,
-      warnings,
-    };
   }
 
   private prepareAuthorityManifestForDraft(
@@ -7195,48 +5701,6 @@ export class SkillFlowApp {
       }
     }
     return conflicts;
-  }
-
-  private findExactDuplicateLeafSelections(
-    manifest: RuntimeManifestView,
-    lockFile: LockFile,
-    currentSourceId: string,
-    enabledTargets: DeploymentTargetId[],
-  ): Set<string> {
-    const conflictingKeys = new Set<string>();
-
-    for (const source of manifest.sources) {
-      if (source.id === currentSourceId) {
-        continue;
-      }
-
-      const binding = manifest.bindings[source.id];
-      if (!binding) {
-        continue;
-      }
-
-      for (const target of enabledTargets) {
-        const targetBinding = binding.targets[target];
-        if (!targetBinding?.enabled) {
-          continue;
-        }
-
-        for (const leafId of targetBinding.leafIds) {
-          const leaf = lockFile.leafInventory.find((item) => item.id === leafId);
-          if (!leaf) {
-            continue;
-          }
-          conflictingKeys.add(this.getExactDuplicateKey(leaf));
-        }
-      }
-    }
-
-    const currentLeafs = lockFile.leafInventory.filter((leaf) => leaf.sourceId === currentSourceId);
-    return new Set(
-      currentLeafs
-        .filter((leaf) => conflictingKeys.has(this.getExactDuplicateKey(leaf)))
-        .map((leaf) => leaf.id),
-    );
   }
 
   private getExactDuplicateKey(leaf: LeafRecord | LeafRecord): string {
@@ -7547,32 +6011,6 @@ export class SkillFlowApp {
         restore();
       }
     }
-  }
-
-  private buildProjectedLinkNameMap(
-    manifest: RuntimeManifestView,
-    lockFile: LockFile,
-    target: DeploymentTargetId,
-  ): Map<string, string> {
-    return resolveProjectedSkillNames(
-      manifest.sources.flatMap((source) => {
-        const targetBinding = manifest.bindings[source.id]?.targets[target];
-        if (!targetBinding?.enabled) {
-          return [];
-        }
-
-        return targetBinding.leafIds
-          .map((leafId) => lockFile.leafInventory.find((leaf) => leaf.id === leafId))
-          .filter((leaf): leaf is LeafRecord => Boolean(leaf))
-          .map((leaf) => ({
-            leafId: leaf.id,
-            groupId: source.id,
-            groupName: source.displayName,
-            groupAuthor: getHostedGitOwner(source.locator),
-            skillName: leaf.linkName,
-          }));
-      }),
-    );
   }
 
   private async findManagedDeploymentOnDisk(
@@ -7915,55 +6353,4 @@ export class SkillFlowApp {
     return `${displayName}@${repo.owner}`;
   }
 
-  private applySourceUpdateResults(
-    manifest: RuntimeManifestView,
-    lockFile: LockFile,
-    updates: SourceUpdateResultItem[],
-  ) {
-    for (const update of updates) {
-      if (!update.changed) {
-        continue;
-      }
-      const source = manifest.sources.find((item) => item.id === update.sourceId);
-      const binding = manifest.bindings[update.sourceId];
-      if (!source || !binding) {
-        continue;
-      }
-
-      for (const diff of update.diffs) {
-        if (diff.kind !== "moved" || !diff.previousLeafId) {
-          continue;
-        }
-        for (const targetBinding of Object.values(binding.targets)) {
-          if (!targetBinding?.enabled || !targetBinding.leafIds.includes(diff.previousLeafId)) {
-            continue;
-          }
-          targetBinding.leafIds = targetBinding.leafIds.map((leafId) =>
-            leafId === diff.previousLeafId ? diff.leafId : leafId,
-          );
-        }
-      }
-
-      if ((update.selectionMode ?? source.selectionMode) !== "all") {
-        continue;
-      }
-
-      const addedLeafIds = update.diffs
-        .filter((diff) => diff.kind === "added")
-        .map((diff) => diff.leafId);
-      if (addedLeafIds.length === 0) {
-        continue;
-      }
-
-      for (const targetBinding of Object.values(binding.targets)) {
-        if (!targetBinding?.enabled) {
-          continue;
-        }
-        const merged = new Set([...targetBinding.leafIds, ...addedLeafIds]);
-        targetBinding.leafIds = [...merged].filter((leafId) =>
-          lockFile.leafInventory.some((leaf) => leaf.id === leafId && leaf.sourceId === update.sourceId),
-        );
-      }
-    }
-  }
 }

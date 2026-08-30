@@ -43,6 +43,8 @@ adopt-external-source
 configure-external-source
 external-status
 external-update
+refresh-usage
+usage-snapshot
 add
 apply
 update
@@ -51,6 +53,12 @@ save-settings
 ```
 
 Bridge changes are external changes. Update parser tests, CLI bridge behavior, desktop bridge models, and release/user docs when changing this surface.
+
+`bootstrap` 返回桌面首屏所需的读取模型：工作流摘要、草稿、项目范围、设置与缓存的卡片补充数据。权威状态 `manifest`、`lockFile` 和诊断报告不进入首屏响应，避免随技能清单规模放大启动负载；需要权威状态或诊断时应使用对应的查询或命令。
+
+`update`、`import-source` 与 `commit-import-source` 成功时会在原有 mutation data 中附带 `workspace`，其结构与 `bootstrap` data 一致。Desktop 应优先应用该快照；仅当旧 helper 或异常响应未返回 `workspace` 时，才回退到独立的 `list` / `doctor` 恢复链路。
+
+`scan-local-import-groups` 成功响应只返回 `localScanGroups`。每个 group 的状态为 `local-only`、`version-conflict` 或 `already-managed`，`importChoices` 使用 `sourceChoiceId` 与 `sourcePath` 表示最终本地导入来源；调用方不得回退解析旧 `groups` 卡片或 legacy Agents origin metadata。
 
 Desktop helper execution is always time-bounded. Ordinary commands use 60
 seconds, import/add commands use 5 minutes, and managed update scales by the
@@ -79,6 +87,8 @@ When adding, removing, or renaming a bridge command:
 State compatibility is implemented in `packages/storage` and domain types live in `packages/domain`.
 
 State shape changes are external changes. Add storage/domain tests and migration or normalizer coverage.
+
+`preferences.json` 只持久化当前设置字段；历史 `localImportChoices` 与 `localScanImportChoices` 不属于权威状态，迁移或下一次设置写入时会被丢弃。
 
 The recovery journal has structural and semantic validation and must be
 recovered before bootstrap prunes missing checkouts. It records source kind,

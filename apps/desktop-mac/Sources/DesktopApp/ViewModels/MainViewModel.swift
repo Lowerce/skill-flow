@@ -1,7 +1,5 @@
 import Foundation
 import Observation
-import CryptoKit
-import Yams
 
 @MainActor
 @Observable
@@ -9,37 +7,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     struct ScopedSourceKey: Hashable {
         let scope: ProjectScopeSelection
         let sourceId: String
-    }
-
-    private struct ParsedUpdateItem {
-        let sourceId: String?
-        let changed: Bool
-        let addedLeafIds: [String]
-        let removedLeafIds: [String]
-        let invalidatedLeafIds: [String]
-
-        var hasActualChange: Bool {
-            changed
-                || !addedLeafIds.isEmpty
-                || !removedLeafIds.isEmpty
-                || !invalidatedLeafIds.isEmpty
-        }
-
-        var summaryBucket: UpdateSummaryBucket {
-            if !invalidatedLeafIds.isEmpty {
-                return .needsReview
-            }
-            if changed || !addedLeafIds.isEmpty || !removedLeafIds.isEmpty {
-                return .updated
-            }
-            return .upToDate
-        }
-    }
-
-    private enum UpdateSummaryBucket {
-        case updated
-        case upToDate
-        case needsReview
     }
 
     enum Page: Equatable {
@@ -50,106 +17,13 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         case detail(sourceId: String)
     }
 
-    private struct DraftState: Equatable {
-        var selectedLeafIds: [String]
-        var enabledTargets: [String]
-    }
-
-    private struct WorkflowSummary: Sendable {
-        enum SelectionMode: String, Sendable {
-            case all
-            case selected
-        }
-
-        let sourceId: String
-        let sourceKind: String
-        let sourceDisplayName: String
-        let sourceOriginalDisplayName: String
-        let sourceLocator: String
-        let sourceCanonicalRepo: String?
-        let selectionMode: SelectionMode?
-        let leafs: [LeafSummary]
-        let selectedLeafIds: [String]
-        let enabledTargets: [String]
-        let targetLeafIdsByTarget: [String: [String]]
-        let health: String
-        let warningCount: Int
-        let errorCount: Int
-        let updatedAt: String
-
-        func renamed(displayName: String, originalDisplayName: String) -> WorkflowSummary {
-            WorkflowSummary(
-                sourceId: sourceId,
-                sourceKind: sourceKind,
-                sourceDisplayName: displayName,
-                sourceOriginalDisplayName: originalDisplayName,
-                sourceLocator: sourceLocator,
-                sourceCanonicalRepo: sourceCanonicalRepo,
-                selectionMode: selectionMode,
-                leafs: leafs,
-                selectedLeafIds: selectedLeafIds,
-                enabledTargets: enabledTargets,
-                targetLeafIdsByTarget: targetLeafIdsByTarget,
-                health: health,
-                warningCount: warningCount,
-                errorCount: errorCount,
-                updatedAt: updatedAt
-            )
-        }
-    }
-
-    private struct LeafSummary: Sendable {
-        let id: String
-        let sourceId: String?
-        let linkName: String
-        let name: String
-        let description: String
-        let sourceTitle: String?
-        let metadataWarnings: [String]
-    }
-
-    private struct FileTreeNode: Sendable {
-        var name: String
-        var isFile: Bool
-        var children: [String: FileTreeNode]
-
-        init(name: String, isFile: Bool = false, children: [String: FileTreeNode] = [:]) {
-            self.name = name
-            self.isFile = isFile
-            self.children = children
-        }
-    }
-
-    private struct FileTreeSkillReference: Sendable {
-        let skillId: String
-        let folderPath: String
-        let displayTitle: String
-    }
-
-    private struct ParsedDocument: Sendable {
-        let frontMatter: SkillFrontMatter?
-        let metadata: [MetadataEntry]
-        let body: String
-    }
-
-    private struct SkillFrontMatter: Decodable, Sendable {
-        let name: String?
-        let description: String?
-        let version: String?
-        let enabled: Bool?
-    }
-
     private let stateManager: AppStateManager
     private let taskCoordinator: TaskCoordinator
     private let sourceManagement: SourceManagement
     private let importLogic: ImportLogic
     private let settingsStore: DesktopSettingsStore
-    @ObservationIgnored private lazy var detailLogic = DetailLogic(
-        detailEnrichmentQuery: detailEnrichmentQuery,
-        warningsSink: { [weak self] warnings in self?.stateManager.setLatestWarnings(warnings) }
-    )
+    @ObservationIgnored private lazy var detailLogic = DetailLogic()
     private let collectionLogic: CollectionLogic
-    private let detailDocumentStore = DetailDocumentStore()
     let bridgeClient: BridgeClient
     private let detailEnrichmentQuery: any DesktopDetailEnrichmentQuerying
     private let usageQuery: any DesktopUsageQuerying
@@ -167,21 +41,21 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     @MainActor static var currentDateProvider: () -> Date = Date.init
 
     private static var targetOrder: [String] { AgentDisplayCatalog.defaultTargetOrder }
-    private static var minimumSaveLoadingDuration: Duration { .milliseconds(200) }
     private static var defaultRecentlyUpdatedIndicatorDuration: Duration { .seconds(2) }
 
     private let legacyPinnedSourceIdsKey = "desktop.pinnedSourceIds"
     private let pinnedSourceIdsMigrationKey = "desktop.pinnedSourceIds.migratedToRuntimePreferences"
-    private let recommendationsProvider: () -> [ImportRecommendationEntry]
-    private var workingDrafts: [ScopedSourceKey: DraftState] = [:]
     private var detectedTargets: Set<String> = []
     var inspectedPayloadBySourceId: [ScopedSourceKey: [String: Any]] = [:]
     private var detailEnrichmentPayloadBySourceId: [String: [String: Any]] = [:]
+    @ObservationIgnored private var detailEnrichmentTasksBySourceId: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var detailEnrichmentTokensBySourceId: [String: UInt64] = [:]
+    @ObservationIgnored private var detailEnrichmentTokenSeed: UInt64 = 0
+    @ObservationIgnored private var refreshedDetailEnrichmentSourceIds: Set<String> = []
     var usageSnapshot: UsageSnapshotViewData?
     var usageLoadState: LoadState = .idle
     var renamedSourceDisplayNameOverridesBySourceId: [String: String] = [:]
     var renamedSourceOriginalDisplayNameOverridesBySourceId: [String: String] = [:]
-    private var preparedDetailContentBySourceId: [String: DetailLogic.PreparedDetailContent] = [:]
     private var projectScopeChangeToken: UInt64 = 0
     private var cachedSelectedProjectScope: ProjectScopeSelection = .global
     private var cachedRecentProjectScopes: [RecentProjectScopeItem] = []
@@ -304,14 +178,12 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
             delegate: nil
         )
         self.importLogic = ImportLogic(
-            bridgeClient: bridgeClient,
             queryFacade: resolvedQueryFacade,
             commandFacade: resolvedCommandFacade,
             recommendationsProvider: recommendationsProvider,
             delegate: nil
         )
         self.collectionLogic = CollectionLogic(commandFacade: resolvedCommandFacade)
-        self.recommendationsProvider = recommendationsProvider
 
         sourceManagement.setDelegate(self)
         importLogic.setDelegate(self)
@@ -329,6 +201,12 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
                 },
                 isImportInstalledLocally: { [weak self] groupId in
                     self?.importLogic.isImportGroupInstalledLocally(groupId) == true
+                },
+                prepareImport: { [weak self] groupId, request in
+                    await self?.importLogic.prepareImportGroupIfNeeded(
+                        groupId: groupId,
+                        locator: request.locator
+                    )
                 },
                 performUpdate: { [weak self] sourceId in
                     await self?.performQueuedUpdate(sourceId: sourceId)
@@ -364,20 +242,12 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         )
     }
 
-    func showToast(style: ToastStyle, message: String) {
-        stateManager.showToast(style: style, message: message)
-    }
-
     func showToast(style: ToastStyle, text: PresentationText) {
         stateManager.showToast(style: style, text: text)
     }
 
     func showImportInProgressToast() {
         showToast(style: .neutral, text: localizedText("toast.import.in_progress"))
-    }
-
-    func showImportAnotherRunningToast() {
-        showToast(style: .neutral, text: localizedText("toast.operation.already_queued"))
     }
 
     func showOperationAlreadyQueuedToast() {
@@ -510,7 +380,10 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     }
 
     var homeAgentFilterOptions: [HomeAgentFilterOption] {
-        let cards = groupCards
+        homeAgentFilterOptions(from: groupCards)
+    }
+
+    func homeAgentFilterOptions(from cards: [GroupCardModel]) -> [HomeAgentFilterOption] {
         let enabledGroupCountsByTargetId = Dictionary(
             grouping: cards.flatMap { card in
                 card.targets.filter(\.isEnabled).map { target in (target.id, card.id) }
@@ -528,7 +401,10 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     }
 
     var homeStatusFilterOptions: [HomeSidebarFilterOption] {
-        let cards = groupCards
+        homeStatusFilterOptions(from: groupCards)
+    }
+
+    func homeStatusFilterOptions(from cards: [GroupCardModel]) -> [HomeSidebarFilterOption] {
         return [
             HomeSidebarFilterOption(id: "all", count: cards.count),
             HomeSidebarFilterOption(id: "pinned", count: cards.filter(\.isPinned).count),
@@ -536,7 +412,10 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     }
 
     var homeSourceTypeFilterOptions: [HomeSidebarFilterOption] {
-        let cards = groupCards
+        homeSourceTypeFilterOptions(from: groupCards)
+    }
+
+    func homeSourceTypeFilterOptions(from cards: [GroupCardModel]) -> [HomeSidebarFilterOption] {
         return [
             HomeSidebarFilterOption(id: "all", count: cards.count),
             HomeSidebarFilterOption(id: "local", count: cards.filter(Self.isLocalHomeSource).count),
@@ -547,8 +426,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
 
     var effectiveSelectedHomeAgentFilterId: String? {
         guard let selectedHomeAgentFilterId else { return nil }
-        let optionIds = Set(homeAgentFilterOptions.map(\.id))
-        return optionIds.contains(selectedHomeAgentFilterId) ? selectedHomeAgentFilterId : nil
+        return visibleTargetIds().contains(selectedHomeAgentFilterId) ? selectedHomeAgentFilterId : nil
     }
 
     var detectedTargetIdsForSettings: [String] {
@@ -752,7 +630,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
             return nil
         }
 
-        let payload = scopedSourceKey(sourceId: sourceId).flatMap { inspectedPayloadBySourceId[$0] } ?? [:]
+        let payload = mergedDetailPayload(for: sourceId)
         let sourcePayload = payload["source"] as? [String: Any] ?? [:]
         let summaryPayload = payload["summary"] as? [String: Any] ?? [:]
         let lockPayload = summaryPayload["lock"] as? [String: Any] ?? [:]
@@ -799,7 +677,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         guard currentRoute == .home else { return }
         for sourceId in sourceIds {
             guard currentRoute == .home else { return }
-            guard detailEnrichmentPayloadBySourceId[sourceId] == nil else { continue }
             scheduleDetailEnrichmentFetch(sourceId: sourceId)
         }
     }
@@ -839,9 +716,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
                 originalDisplayName: result.originalDisplayName
             )
             scheduleDetailEnrichmentFetch(sourceId: result.sourceId, force: true)
-            if let input = detailInput(for: result.sourceId) {
-                detailLogic.scheduleDetailEnrichmentFetch(input: input)
-            }
             let toastKey = result.isResetToOriginal ? "toast.rename.reset_success" : "toast.rename.success"
             showToast(style: .success, text: localizedText(toastKey, result.displayName))
         } catch {
@@ -1104,6 +978,10 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
             stateManager.setHealthStatus(warnings.isEmpty ? .healthy : .warnings)
             await migrateLegacyPinnedSourceIdsIfNeeded()
             Task { [weak self] in await self?.importLogic.loadImportPageIfNeeded() }
+            Task { [weak self] in
+                guard let self else { return }
+                _ = try? await self.usageQuery.refreshUsage(trigger: "bootstrap")
+            }
         } catch {
             stateManager.setLoadState(.failed(error.localizedDescription))
             stateManager.setHealthStatus(.error)
@@ -1161,9 +1039,9 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
                     inspectedPayloadBySourceId[key] = payload
                 }
                 detailLogic.invalidatePreparedDetailContent(for: sourceId)
-                if let input = detailInput(for: sourceId) {
-                    detailLogic.scheduleDetailContentWarmupIfNeeded(input: input)
-                    detailLogic.scheduleDetailEnrichmentFetch(input: input)
+                let isAwaitingEnrichment = scheduleDetailEnrichmentFetch(sourceId: sourceId)
+                if !isAwaitingEnrichment {
+                    scheduleActiveDetailWarmupIfNeeded(sourceId: sourceId)
                 }
             }
             stateManager.setLatestWarnings(response.warnings)
@@ -1182,16 +1060,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         } catch {
             stateManager.setHealthStatus(.error)
             stateManager.setLastDoctorError(error.localizedDescription)
-        }
-    }
-
-    func updateAll() async {
-        do {
-            _ = try await sourceManagement.updateAll()
-            await synchronizeState(refreshDoctor: true)
-            showToast(style: .success, text: .plain(updateSummaryMessage(from: nil, fallbackCount: sourceIds.count)))
-        } catch {
-            showOperationFailureToast(fallbackKey: "toast.update.failed", fallbackArgument: error.localizedDescription, error: error)
         }
     }
 
@@ -1228,7 +1096,11 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     private func performQueuedUpdate(sourceId: String) async {
         do {
             let response = try await sourceManagement.updateSelectedSource(sourceId)
-            await synchronizeState(refreshDoctor: true)
+            if let response {
+                await synchronizeAfterMutation(response)
+            } else {
+                await synchronizeState(refreshDoctor: true)
+            }
             registerRecentlyUpdatedSources(from: response?.data?.value)
             showToast(style: .success, text: .plain(updateSummaryMessage(from: response?.data?.value, fallbackCount: 1)))
         } catch {
@@ -1239,7 +1111,7 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     private func performQueuedBulkUpdate(sourceIds: [String]) async {
         do {
             let response = try await sourceManagement.updateSourcesReturningResponse(sourceIds)
-            await synchronizeState(refreshDoctor: true)
+            await synchronizeAfterMutation(response)
             registerRecentlyUpdatedSources(from: response.data?.value)
             presentBulkUpdateOutcome(requestedCount: sourceIds.count, payload: response.data?.value, warnings: response.warnings)
         } catch {
@@ -1352,14 +1224,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         )
     }
 
-    func uninstallSelectedSource() async {
-        guard let selectedSourceId else {
-            showToast(style: .error, text: localizedText("toast.uninstall.no_group_selected"))
-            return
-        }
-        await deleteSource(sourceId: selectedSourceId)
-    }
-
     func deleteSource(sourceId: String) async {
         do {
             try await sourceManagement.deleteSource(sourceId: sourceId)
@@ -1428,7 +1292,16 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     }
 
     func detailViewData(for sourceId: String) -> DetailViewData? {
-        detailInput(for: sourceId).map { detailLogic.detailViewData(for: $0) }
+        detailInput(for: sourceId).map {
+            detailLogic.detailViewData(
+                for: $0,
+                schedulesWarmup: detailEnrichmentTasksBySourceId[sourceId] == nil
+            )
+        }
+    }
+
+    func hasPreparedOrScheduledDetailContent(for sourceId: String) -> Bool {
+        detailLogic.hasPreparedOrScheduledDetailContent(for: sourceId)
     }
 
     func detailSnapshot(for sourceId: String) -> DetailViewModel.Snapshot? {
@@ -1509,12 +1382,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
             drafts: projectionDrafts(),
             sourceId: sourceId
         )
-    }
-
-    func formattedCount(_ value: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
     func relativeUpdateLabel(_ updatedAt: String) -> String {
@@ -1659,9 +1526,9 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
             guard let payload = rawValue as? [String: Any] else {
                 continue
             }
-            let mergedPayload = mergedDetailEnrichmentPayload(
-                existing: detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
-                incoming: payload
+            let mergedPayload = DetailPayloadOverlay.merge(
+                detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
+                with: payload
             )
             if !mergedPayload.isEmpty {
                 detailEnrichmentPayloadBySourceId[sourceId] = mergedPayload
@@ -1675,19 +1542,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
 
     func currentProjectScopeForSourceManagement() -> ProjectScopeSelection {
         currentProjectScope()
-    }
-
-    private func mergedDetailEnrichmentPayload(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
-        var mergedPayload = existing
-        for (key, value) in incoming {
-            if let existingObject = mergedPayload[key] as? [String: Any],
-               let incomingObject = value as? [String: Any] {
-                mergedPayload[key] = mergedDetailEnrichmentPayload(existing: existingObject, incoming: incomingObject)
-            } else {
-                mergedPayload[key] = value
-            }
-        }
-        return mergedPayload
     }
 
     private func parseProjectScopeSelection(_ value: Any?) -> ProjectScopeSelection? {
@@ -1818,7 +1672,19 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         }
     }
 
-    func cancelDeferredDraftSync() {
+    func synchronizeAfterMutation(_ response: BridgeResponse, inspectSourceId: String? = nil) async {
+        guard sourceManagement.applyMutationWorkspace(response.data?.value) else {
+            await synchronizeState(refreshDoctor: true, inspectSourceId: inspectSourceId)
+            return
+        }
+        detectedTargets = sourceManagement.detectedTargetIds()
+        stateManager.setLatestWarnings(response.warnings)
+        stateManager.setHealthStatus(response.warnings.isEmpty ? .healthy : .warnings)
+        if let inspectSourceId = inspectSourceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !inspectSourceId.isEmpty,
+           sourceIds.contains(inspectSourceId) {
+            await selectSource(inspectSourceId)
+        }
     }
 
     func localizedText(_ key: String, _ arguments: [String]) -> PresentationText {
@@ -1828,42 +1694,85 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         return .localized(key, arguments)
     }
 
-    private func scheduleDetailEnrichmentFetch(sourceId: String, force: Bool = false) {
-        Task { @MainActor [weak self] in
+    @discardableResult
+    private func scheduleDetailEnrichmentFetch(sourceId: String, force: Bool = false) -> Bool {
+        if !force {
+            if refreshedDetailEnrichmentSourceIds.contains(sourceId) {
+                return false
+            }
+            if detailEnrichmentTasksBySourceId[sourceId] != nil {
+                return true
+            }
+        } else {
+            detailEnrichmentTasksBySourceId[sourceId]?.cancel()
+            detailEnrichmentTasksBySourceId.removeValue(forKey: sourceId)
+        }
+
+        detailEnrichmentTokenSeed &+= 1
+        let token = detailEnrichmentTokenSeed
+        detailEnrichmentTokensBySourceId[sourceId] = token
+
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer {
+                if self.detailEnrichmentTokensBySourceId[sourceId] == token {
+                    self.detailEnrichmentTasksBySourceId.removeValue(forKey: sourceId)
+                    self.detailEnrichmentTokensBySourceId.removeValue(forKey: sourceId)
+                }
+            }
             do {
-                let response = try await self.bridgeClient.inspectEnrichment(sourceId: sourceId)
+                let response = try await self.detailEnrichmentQuery.inspectEnrichment(sourceId: sourceId)
+                guard !Task.isCancelled,
+                      self.detailEnrichmentTokensBySourceId[sourceId] == token else {
+                    return
+                }
                 if let payload = response.data?.value as? [String: Any] {
                     let displayName = self.renamedSourceDisplayNameOverridesBySourceId[sourceId]
                         ?? self.sourceManagement.summary(for: sourceId)?.sourceDisplayName
                     let originalDisplayName = self.renamedSourceOriginalDisplayNameOverridesBySourceId[sourceId]
                         ?? self.sourceManagement.summary(for: sourceId)?.sourceOriginalDisplayName
                         ?? displayName
+                    let normalizedPayload: [String: Any]
                     if let displayName, let originalDisplayName {
-                        let normalizedPayload = self.enrichmentPayloadWithDisplayName(
+                        normalizedPayload = self.enrichmentPayloadWithDisplayName(
                             payload,
                             displayName: displayName,
                             originalDisplayName: originalDisplayName
                         )
-                        self.detailEnrichmentPayloadBySourceId[sourceId] = self.mergedDetailEnrichmentPayload(
-                            existing: self.detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
-                            incoming: normalizedPayload
-                        )
                     } else {
-                        self.detailEnrichmentPayloadBySourceId[sourceId] = self.mergedDetailEnrichmentPayload(
-                            existing: self.detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
-                            incoming: payload
-                        )
+                        normalizedPayload = payload
+                    }
+                    self.detailEnrichmentPayloadBySourceId[sourceId] = DetailPayloadOverlay.merge(
+                        self.detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
+                        with: normalizedPayload
+                    )
+                    if self.isActiveDetailSource(sourceId) {
+                        self.detailLogic.invalidatePreparedDetailContent(for: sourceId)
                     }
                 }
+                self.refreshedDetailEnrichmentSourceIds.insert(sourceId)
                 self.stateManager.setLatestWarnings(response.warnings)
+                self.scheduleActiveDetailWarmupIfNeeded(sourceId: sourceId)
             } catch {
+                self.scheduleActiveDetailWarmupIfNeeded(sourceId: sourceId)
             }
         }
+        detailEnrichmentTasksBySourceId[sourceId] = task
+        return true
     }
 
-    private func invalidatePreparedDetailContent(for sourceId: String) {
-        preparedDetailContentBySourceId.removeValue(forKey: sourceId)
+    private func scheduleActiveDetailWarmupIfNeeded(sourceId: String) {
+        guard isActiveDetailSource(sourceId), let input = detailInput(for: sourceId) else {
+            return
+        }
+        detailLogic.scheduleDetailContentWarmupIfNeeded(input: input)
+    }
+
+    private func isActiveDetailSource(_ sourceId: String) -> Bool {
+        guard case .detail(let activeSourceId) = currentRoute else {
+            return false
+        }
+        return activeSourceId == sourceId
     }
 
     func preferredGroupPath(lockPayload: [String: Any], leafPayloads: [[String: Any]]) -> String? {
@@ -1935,10 +1844,9 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
     }
 
     private func mergedDetailPayload(for sourceId: String) -> [String: Any] {
-        var payload = inspectedPayloadBySourceId[ScopedSourceKey(scope: currentProjectScope(), sourceId: sourceId)] ?? [:]
+        let payload = inspectedPayloadBySourceId[ScopedSourceKey(scope: currentProjectScope(), sourceId: sourceId)] ?? [:]
         let enrichmentPayload = detailEnrichmentPayloadBySourceId[sourceId] ?? [:]
-        for (key, value) in enrichmentPayload { payload[key] = value }
-        return payload
+        return DetailPayloadOverlay.merge(payload, with: enrichmentPayload)
     }
 
     private func updateSummaryMessage(from value: Any?, fallbackCount: Int) -> String {
@@ -2030,18 +1938,6 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         return normalized
     }
 
-    private func groupLabel(for sourceId: String) -> String {
-        sourceManagement.summary(for: sourceId)?.sourceDisplayName ?? sourceId
-    }
-
-    private func leafLabel(for leafId: String, sourceId: String) -> String {
-        sourceManagement.summary(for: sourceId)?.leafs.first(where: { $0.id == leafId })?.name ?? leafId
-    }
-
-    private func targetLabel(for targetId: String) -> String {
-        AgentDisplayCatalog.label(for: targetId, customAgents: routeState?.settings.customAgents ?? [])
-    }
-
     private func localizedText(_ key: String, _ arguments: String...) -> PresentationText {
         .localized(key, arguments)
     }
@@ -2079,260 +1975,8 @@ final class MainViewModel: SourceManagementDelegate, ImportLogicDelegate {
         )
     }
 
-    // MARK: - Static Utility Methods (kept for backward compatibility)
-
-    static func isSupportedImportLocator(_ value: String) -> Bool {
-        let candidate = normalizedImportLocator(value)
-        guard !candidate.isEmpty else { return false }
-        let lowercasedCandidate = candidate.lowercased()
-        if lowercasedCandidate.hasPrefix("file://"), candidate.count > "file://".count { return true }
-        if lowercasedCandidate.hasPrefix("clawhub:"), candidate.count > "clawhub:".count { return true }
-        if candidate.hasPrefix("/") || candidate.hasPrefix("~/") { return true }
-        if isSupportedGitHTTPSLocator(candidate) { return true }
-        if matches(candidate, pattern: #"^git@(github|gitlab)\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$"#) { return true }
-        if matches(candidate, pattern: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$"#) { return true }
-        return matches(candidate, pattern: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?@[A-Za-z0-9_.-]+$"#) ||
-               matches(candidate, pattern: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?(?:/[A-Za-z0-9_.-]+)+$"#)
-    }
-
-    static func normalizedImportLocator(_ value: String) -> String {
-        var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard candidate.count >= 2 else { return candidate }
-        let first = candidate.first
-        let last = candidate.last
-        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
-            candidate.removeFirst(); candidate.removeLast()
-            candidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return candidate
-    }
-
-    private static func isSupportedGitHTTPSLocator(_ candidate: String) -> Bool {
-        guard !candidate.containsWhitespace else { return false }
-        guard let components = URLComponents(string: candidate), components.scheme?.lowercased() == "https", let host = components.host?.lowercased(), host == "github.com" || host == "gitlab.com" else { return false }
-        let pathSegments = components.path.split(separator: "/").filter { !$0.isEmpty }.map(String.init)
-        guard pathSegments.count >= 2 else { return false }
-        switch host {
-        case "github.com": return pathSegments.count == 2 || (pathSegments.count >= 4 && pathSegments[2].lowercased() == "tree")
-        case "gitlab.com":
-            let treeMarkerIndex = pathSegments.indices.first { index in
-                pathSegments[index] == "-"
-                    && pathSegments.indices.contains(index + 1)
-                    && pathSegments[index + 1] == "tree"
-            }
-
-            if let treeMarkerIndex {
-                return treeMarkerIndex >= 2 && pathSegments.count >= treeMarkerIndex + 3
-            }
-
-            let hasUnsupportedPagePath = pathSegments.contains("-")
-                || pathSegments.contains { ["tree", "blob", "issues", "merge_requests"].contains($0) }
-
-            return pathSegments.count >= 2 && !hasUnsupportedPagePath
-        default: return false
-        }
-    }
-
-    private static func matches(_ value: String, pattern: String) -> Bool {
-        value.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
-    }
-
-    // MARK: - Document & FileTree Utilities (kept for backward compatibility)
-
-    nonisolated static func parseDetailDocument(_ content: String) -> (metadata: [MetadataEntry], body: String) {
-        let lines = content.components(separatedBy: .newlines)
-        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" else {
-            return ([], content.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        guard let closingIndex = lines.dropFirst().firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "---" }) else {
-            return ([], content.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        let frontMatterText = Array(lines[1..<closingIndex]).joined(separator: "\n")
-        let metadata = parseFrontmatterEntries(frontMatterText)
-        let bodyLines = closingIndex + 1 < lines.count ? Array(lines[(closingIndex + 1)...]) : []
-        return (metadata, bodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-
-    nonisolated private static func parseFrontmatterEntries(_ frontMatterText: String) -> [MetadataEntry] {
-        guard let dictionary = (try? Yams.load(yaml: frontMatterText)) as? [String: Any] else {
-            return []
-        }
-        return dictionary.keys.sorted().compactMap { key in
-            guard let value = dictionary[key] else { return nil }
-            let renderedValue = stringifyMetadataValue(value)
-            return MetadataEntry(id: "\(key):\(renderedValue)", key: key, value: renderedValue)
-        }
-    }
-
-    nonisolated private static func stringifyMetadataValue(_ value: Any) -> String {
-        switch value {
-        case let string as String:
-            return string
-        case let number as NSNumber:
-            return number.stringValue
-        case let values as [Any]:
-            return values.map(stringifyMetadataValue).joined(separator: ", ")
-        case let dictionary as [String: Any]:
-            return dictionary.keys.sorted()
-                .map { "\($0): \(stringifyMetadataValue(dictionary[$0] as Any))" }
-                .joined(separator: ", ")
-        default:
-            return String(describing: value)
-        }
-    }
-
-    nonisolated static func documentDescriptors(_ tabs: [DocumentTab]) -> [DocumentDescriptor] {
-        tabs.map { DocumentDescriptor(id: $0.id, title: $0.title, path: $0.path, metadata: $0.metadata, renderCacheKey: $0.renderCacheKey, externalURL: $0.externalURL) }
-    }
-
-    nonisolated static func documentDescriptor(for tab: DocumentTab) -> DocumentDescriptor {
-        DocumentDescriptor(id: tab.id, title: tab.title, path: tab.path, metadata: tab.metadata, renderCacheKey: tab.renderCacheKey, externalURL: tab.externalURL)
-    }
-
-    nonisolated static func placeholderDocumentTabs(_ descriptors: [DocumentDescriptor]) -> [DocumentTab] {
-        descriptors.map { DocumentTab(id: $0.id, title: $0.title, path: $0.path, metadata: $0.metadata, content: "", renderCacheKey: $0.renderCacheKey, externalURL: $0.externalURL, isLoaded: false) }
-    }
-
-    nonisolated static func detailRevision(
-        sourceId: String,
-        title: String,
-        originalDisplayName: String,
-        subtitle: String,
-        author: String,
-        originLabel: String,
-        starCount: Int?,
-        groupStats: GroupCardStats,
-        sourceDetailLines: [String],
-        sourceRepositoryURL: String?,
-        locator: String,
-        groupPath: String?,
-        updatedAt: String,
-        updatedRelative: String,
-        health: String,
-        warningCount: Int,
-        errorCount: Int,
-        enabledSkillCount: Int,
-        totalSkillCount: Int,
-        enabledTargetCount: Int,
-        saveState: SaveState,
-        skillSelection: SelectionState,
-        targetSelection: SelectionState,
-        enabledTargetLabels: [String],
-        sourceFacts: [String],
-        deploymentFacts: [String],
-        fileTree: [FileTreeItem],
-        groupDocuments: [DocumentDescriptor],
-        targets: [DetailTarget],
-        skills: [DetailSkill]
-    ) -> String {
-        let components: [String] = [
-            sourceId,
-            title,
-            originalDisplayName,
-            subtitle,
-            author,
-            originLabel,
-            starCount.map(String.init) ?? "",
-            detailSignature(groupStats),
-            sourceDetailLines.joined(separator: "\u{1f}"),
-            sourceRepositoryURL ?? "",
-            locator,
-            groupPath ?? "",
-            updatedAt,
-            updatedRelative,
-            health,
-            String(warningCount),
-            String(errorCount),
-            String(enabledSkillCount),
-            String(totalSkillCount),
-            String(enabledTargetCount),
-            detailSignature(saveState),
-            detailSignature(skillSelection),
-            detailSignature(targetSelection),
-            enabledTargetLabels.joined(separator: "\u{1f}"),
-            sourceFacts.joined(separator: "\u{1f}"),
-            deploymentFacts.joined(separator: "\u{1f}"),
-            detailSignature(fileTree),
-            detailSignature(groupDocuments),
-            detailSignature(targets),
-            detailSignature(skills)
-        ]
-        return components.joined(separator: "\u{1e}")
-    }
-
-    nonisolated private static func detailSignature(_ value: Any) -> String {
-        String(describing: value)
-    }
-
-    nonisolated static func preferredDetailGroupTitle(
-        sourceId: String,
-        displayName: String?,
-        snapshotTitle: String?,
-        locator: String
-    ) -> String {
-        if let displayName = sanitizedDetailTitle(displayName) {
-            return displayName
-        }
-        if let snapshotTitle = snapshotTitle?.nonEmpty { return snapshotTitle }
-        return detailTitleFallback(from: locator, sourceId: sourceId)
-    }
-
-    nonisolated static func preferredDetailSkillTitle(
-        preparedTitle: String?,
-        payloadTitle: String?,
-        projectedName: String?,
-        snapshotTitle: String?,
-        rawLeafName: String?,
-        fallbackLinkName: String?
-    ) -> String {
-        if let preparedTitle, !preparedTitle.isEmpty { return preparedTitle }
-        if let payloadTitle, !payloadTitle.isEmpty { return payloadTitle }
-        if let projectedName, !projectedName.isEmpty { return projectedName }
-        if let snapshotTitle, !snapshotTitle.isEmpty { return snapshotTitle }
-        if let rawLeafName = sanitizedDetailTitle(rawLeafName) { return rawLeafName }
-        return fallbackLinkName ?? ""
-    }
-
-    nonisolated private static func sanitizedDetailTitle(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return nil
-        }
-
-        let lowercase = trimmed.lowercased()
-        let rejectedFragments = [
-            "zsh-compatible:",
-            "use find",
-            "no such file",
-            "command not found",
-            "permission denied",
-        ]
-        if rejectedFragments.contains(where: { lowercase.contains($0) }) {
-            return nil
-        }
-
-        return trimmed
-    }
-
-    nonisolated private static func detailTitleFallback(from locator: String, sourceId: String) -> String {
-        let trimmed = locator
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: ".git", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-
-        guard !trimmed.isEmpty else {
-            return sourceId
-        }
-
-        if locator.hasPrefix("clawhub:"),
-           let slug = locator.split(separator: ":").last?.split(separator: "@").first {
-            return String(slug.split(separator: "/").last ?? Substring(sourceId))
-        }
-
-        return trimmed.split(separator: "/").last.map(String.init) ?? sourceId
-    }
 }
 
 extension String {
     var nonEmpty: String? { isEmpty ? nil : self }
-    var containsWhitespace: Bool { rangeOfCharacter(from: .whitespacesAndNewlines) != nil }
 }

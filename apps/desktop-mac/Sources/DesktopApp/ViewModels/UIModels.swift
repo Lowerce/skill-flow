@@ -372,6 +372,30 @@ struct UsageHourlyActivityViewData: Equatable {
     let observedUses: Int
 }
 
+struct UsageHourlyActivityGrid: Equatable {
+    private static let weekdayCount = 7
+    private static let hourCount = 24
+
+    private let slots: [Int]
+    let maximum: Int
+
+    init(_ activity: [UsageHourlyActivityViewData]) {
+        var slots = Array(repeating: 0, count: Self.weekdayCount * Self.hourCount)
+        for item in activity where (0..<Self.weekdayCount).contains(item.weekday) && (0..<Self.hourCount).contains(item.hour) {
+            slots[(item.weekday * Self.hourCount) + item.hour] = item.observedUses
+        }
+        self.slots = slots
+        maximum = slots.max() ?? 0
+    }
+
+    func observedUses(weekday: Int, hour: Int) -> Int {
+        guard (0..<Self.weekdayCount).contains(weekday), (0..<Self.hourCount).contains(hour) else {
+            return 0
+        }
+        return slots[(weekday * Self.hourCount) + hour]
+    }
+}
+
 struct UsageSkillAgentMatrixViewData: Equatable {
     let skillKey: String
     let skillRef: String?
@@ -578,6 +602,19 @@ struct DocumentDescriptor: Identifiable, Equatable, Sendable {
     let metadata: [MetadataEntry]
     let renderCacheKey: String
     let externalURL: String?
+
+    var placeholderTab: DocumentTab {
+        DocumentTab(
+            id: id,
+            title: title,
+            path: path,
+            metadata: metadata,
+            content: "",
+            renderCacheKey: renderCacheKey,
+            externalURL: externalURL,
+            isLoaded: false
+        )
+    }
 }
 
 struct DocumentTab: Identifiable, Equatable, Sendable {
@@ -609,6 +646,17 @@ struct DocumentTab: Identifiable, Equatable, Sendable {
         self.externalURL = externalURL
         self.isLoaded = isLoaded
     }
+
+    var descriptor: DocumentDescriptor {
+        DocumentDescriptor(
+            id: id,
+            title: title,
+            path: path,
+            metadata: metadata,
+            renderCacheKey: renderCacheKey,
+            externalURL: externalURL
+        )
+    }
 }
 
 struct DetailTarget: Identifiable, Equatable, Sendable {
@@ -616,14 +664,6 @@ struct DetailTarget: Identifiable, Equatable, Sendable {
     let label: String
     let shortLabel: String
     let isEnabled: Bool
-}
-
-struct FileTreeLine: Identifiable, Sendable {
-    let id: String
-    let depth: Int
-    let prefix: String
-    let title: String
-    let isFile: Bool
 }
 
 struct FileTreeItem: Identifiable, Equatable, Sendable {
@@ -872,7 +912,6 @@ struct LocalImportDetectedSkill: Identifiable, Equatable {
     let localPath: String
     let discoveredTargets: [String]
     let validationStatus: String
-    let originSkillId: String?
 }
 
 struct LocalImportInfo: Equatable {

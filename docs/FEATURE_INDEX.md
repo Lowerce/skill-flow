@@ -5,7 +5,8 @@
 | 主题 | 状态 | 规格 | 计划 / 记录 | 验证 |
 | --- | --- | --- | --- | --- |
 | Active superpowers specs | Empty | [status](superpowers/specs/README.md) | - | - |
-| Active superpowers plans | Empty | - | [status](superpowers/plans/README.md) | - |
+| Import Discovery deepening | Active | - | [plan](superpowers/plans/2026-08-29-import-discovery-deepening.md) | Pending |
+| Equivalent architecture cleanup | Completed | - | [archive](archives/plans/2026-08-29-equivalent-architecture-cleanup.md) | Passed |
 | Archived specs | Archived | [archive](archives/specs/) | - | - |
 | Archived plans | Archived | - | [archive](archives/plans/) | - |
 | Plugin assets and target routing | Issue | - | [analysis](issues/ISSUE_8_plugin_assets_and_target_routing.md), [user report](issues/ISSUE_8_plugin_assets_and_target_routing_user_report.md) | - |

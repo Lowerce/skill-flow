@@ -797,76 +797,20 @@ export type UnifiedSourceSnapshot = {
 
 export type UnifiedSourceSnapshotCacheEntry = {
   canonicalRepo: string;
-  checkedAt: string;
   expiresAt: string;
   data: UnifiedSourceSnapshot;
 };
 
-export type RepoMetadataProvider = "skills" | "github" | "clawhub" | "local";
-
-export type RepoMetadataIdentity = {
-  canonicalRepo: string;
-  aliases: string[];
-  origins: RepoMetadataProvider[];
-};
-
-export type RepoMetadataProviderEntry = {
-  provider: RepoMetadataProvider;
-  status: "ready" | "failed" | "unsupported";
-  checkedAt: string;
-  expiresAt: string;
-  reasonCode?: SourceMetadataReasonCode;
-  retryable?: boolean;
-  data?: SourceStats;
-  snapshot?: UnifiedSourceSnapshot;
-};
-
-export type ResolvedRepoMetadataField =
-  | "title"
-  | "author"
-  | "summary"
-  | "githubUrl"
-  | "sourceUrl"
-  | "skillCount"
-  | "downloadCount"
-  | "starCount";
-
-export type ResolvedRepoMetadata = {
-  title?: string;
-  author?: string;
-  summary?: string;
-  githubUrl?: string;
-  sourceUrl?: string;
-  skillCount?: number;
-  downloadCount?: number;
-  starCount?: number;
-  fieldSources: Partial<Record<ResolvedRepoMetadataField, RepoMetadataProvider>>;
-};
-
-export type RepoMetadataCacheEntry = {
-  canonicalRepo: string;
-  checkedAt: string;
-  expiresAt: string;
-  identity: RepoMetadataIdentity;
-  providers: Partial<Record<RepoMetadataProvider, RepoMetadataProviderEntry>>;
-  resolved: ResolvedRepoMetadata;
-};
-
 export type ImportSearchHit = {
-  id: string;
   skillId: string;
   title: string;
   installs?: number;
-  source: string;
   canonicalRepo: string;
 };
 
 export type ImportSearchSnapshot = {
-  query: string;
-  checkedAt: string;
   expiresAt: string;
   hits: ImportSearchHit[];
-  groups: string[];
 };
 
 export type ImportRecommendationFeedId =
@@ -877,15 +821,13 @@ export type ImportRecommendationFeedId =
   | "audits";
 
 export type ImportRecommendationFeed = {
-  id: ImportRecommendationFeedId;
-  checkedAt: string;
   expiresAt: string;
   groups: string[];
 };
 
 export type ImportDataCache = {
   searches: Record<string, ImportSearchSnapshot>;
-  repos: Record<string, RepoMetadataCacheEntry>;
+  repos: Record<string, UnifiedSourceSnapshotCacheEntry>;
   recommendations: Record<string, ImportRecommendationFeed>;
 };
 
@@ -899,41 +841,10 @@ export type ImportAsyncState =
       retryable: boolean;
     };
 
-export type LocalImportValidationStatus =
-  | "matched"
-  | "changed"
-  | "missing"
-  | "ambiguous"
-  | "origin-unavailable"
-  | "local-only";
-
-export type LocalImportChoiceId = "origin" | "local";
-
-export type LocalImportDetectedSkill = {
-  id: string;
-  title: string;
-  localPath: string;
-  discoveredTargets: DeploymentTargetId[];
-  validationStatus: LocalImportValidationStatus;
-  originSkillId?: string;
-};
-
-export type LocalImportCandidateInfo = {
-  validationStatus: LocalImportValidationStatus;
-  selectedChoiceId: LocalImportChoiceId;
-  choices: LocalImportChoice[];
-  detectedSkills: LocalImportDetectedSkill[];
-};
-
 export type LocalScanSourcePathKind = "target-agent" | "manual";
 
 export type LocalScanGroupStatus =
   | "local-only"
-  | "matched"
-  | "changed"
-  | "missing"
-  | "ambiguous"
-  | "origin-unavailable"
   | "version-conflict"
   | "already-managed";
 
@@ -959,13 +870,6 @@ export type LocalScanSkill = {
   status: LocalScanGroupStatus;
   variants: LocalScanSkillVariant[];
   selectionRequired: boolean;
-  originSkillId?: string;
-};
-
-export type LocalScanOrigin = {
-  canonicalRepo: string;
-  locator: string;
-  previewStatus: "ready" | "failed";
 };
 
 export type LocalScanGroup = {
@@ -975,12 +879,11 @@ export type LocalScanGroup = {
   sourcePaths: LocalScanSourcePath[];
   skills: LocalScanSkill[];
   importChoices: LocalScanImportChoice[];
-  origin?: LocalScanOrigin;
 };
 
 export type ImportGroupCandidate = {
   id: string;
-  provider: "skills" | "local";
+  provider: "skills";
   locator: string;
   canonicalRepo: string;
   aliases: string[];
@@ -1000,7 +903,6 @@ export type ImportGroupCandidate = {
   }>;
   snapshot?: UnifiedSourceSnapshot;
   enrichState: ImportAsyncState;
-  localImport?: LocalImportCandidateInfo;
 };
 
 export type ImportPreviewTarget = {
@@ -1229,18 +1131,6 @@ export type ImportSkillSelection = {
   selector: ImportSkillSelector;
 };
 
-export type LocalImportChoice = {
-  sourceChoiceId: string;
-  sourceChoiceAlias?: string;
-  label: string;
-  locator: string;
-  detectedSourcePath: string;
-  detectedSkillPath?: RepoPath;
-  variant: "single-skill" | "multi-skill" | "source-root";
-  selectedSkills: ImportSkillSelection[];
-  enabledTargets: DeploymentTargetId[];
-};
-
 export type LocalScanDetectedSkill = {
   leafId: SkillLeafId;
   existingSourceIdHint?: SourceId;
@@ -1273,8 +1163,6 @@ export type PreferencesFile = {
   projectSourceDrafts: Record<string, Record<SourceId, ProjectSourceDraft>>;
   customTargets: CustomTargetDefinition[];
   agentDisplayOrder: DeploymentTargetId[];
-  localImportChoices?: LocalImportChoice[];
-  localScanImportChoices?: LocalScanImportChoice[];
 };
 
 export type SkillCollectionMemberOrigin = {
@@ -1369,51 +1257,24 @@ export type ImportDraft = {
   enabledTargets: DeploymentTargetId[];
 };
 
-export type PreparedSkillRef = {
-  uiId: string;
-  selector: ImportSkillSelector;
-  leafId: SkillLeafId;
-  repoPath: RepoPath;
-  contentHash: string;
-  selectorAliases: string[];
-};
-
 export type ImportPreparationRecord = {
-  schemaVersion?: SchemaVersion;
   id: string;
-  preparationId?: string;
   cacheKey?: string;
   locator: string;
   canonicalRepo: string;
-  sourceLocator?: string;
-  canonicalLocator?: string;
   requestedPath?: string;
-  sourceSelectionKey?: string;
-  existingSourceIdHint?: SourceId;
   sourceKind: SourceKind;
   checkoutPath: string;
   sourceId: string;
   displayName: string;
-  sourceRevision?: SourceRevision;
-  availableTargets: DeploymentTargetId[];
-  commitSha?: string;
-  skillIds: string[];
-  skillRefs?: PreparedSkillRef[];
-  currentAttempt?: {
-    attemptId: string;
-    commitStartedAt?: string;
-  };
-  status: ImportPreparationStatus | "committed" | "expired";
+  status: ImportPreparationStatus;
   failure?: {
     reasonCode: string;
     retryable: boolean;
     message: string;
-    diagnostics?: Diagnostic[];
   };
-  diagnostics?: Diagnostic[];
   preparedAt: string;
   expiresAt: string;
-  createdAt?: string;
 };
 
 export type SourceUpdateDiff = {

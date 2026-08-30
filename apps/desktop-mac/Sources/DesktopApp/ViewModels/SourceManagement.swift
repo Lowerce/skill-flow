@@ -243,6 +243,19 @@ final class SourceManagement {
         return bootstrap.warnings
     }
 
+    @discardableResult
+    func applyMutationWorkspace(_ value: Any?) -> Bool {
+        guard
+            let data = value as? [String: Any],
+            let workspace = data["workspace"] as? [String: Any],
+            workspace["summaries"] is [[String: Any]]
+        else {
+            return false
+        }
+        parseBootstrapData(workspace)
+        return true
+    }
+
     func refreshList() async throws -> BridgeResponse {
         let response = try await fetchListResponse()
         applyList(response)
@@ -287,20 +300,7 @@ final class SourceManagement {
         removeStateForSource(sourceId)
     }
 
-    func updateAll() async throws -> Any? {
-        cancelDeferredDraftSync()
-        let response = try await bridgeClient.updateAll()
-        registerRecentlyUpdatedSources(from: response.data?.value)
-        return response.data?.value
-    }
-
-    func updateSources(_ sourceIds: [String]) async throws -> Any? {
-        let response = try await updateSourcesReturningResponse(sourceIds)
-        return response.data?.value
-    }
-
     func updateSourcesReturningResponse(_ sourceIds: [String]) async throws -> BridgeResponse {
-        cancelDeferredDraftSync()
         let response = try await bridgeClient.updateSources(sourceIds)
         registerRecentlyUpdatedSources(from: response.data?.value)
         return response
@@ -309,25 +309,10 @@ final class SourceManagement {
     func updateSelectedSource(_ sourceId: String) async throws -> BridgeResponse? {
         let result = try await mutationCoordinator.updateSelectedSource(sourceId)
         if case let .submitted(_, response) = result {
-            cancelDeferredDraftSync()
             registerRecentlyUpdatedSources(from: response.data?.value)
             return response
         }
         return nil
-    }
-
-    func applyChanges(
-        sourceId: String,
-        scope: ProjectScopeSelection,
-        selectedLeafIds: [String],
-        enabledTargets: [String]
-    ) async throws -> BridgeResponse {
-        try await commandFacade.apply(
-            sourceId: sourceId,
-            scope: scope,
-            selectedLeafIds: selectedLeafIds,
-            enabledTargets: enabledTargets
-        )
     }
 
     func commitDraftChange(
@@ -346,7 +331,6 @@ final class SourceManagement {
         let key = ScopedSourceKey(scope: scope, sourceId: sourceId)
 
         let previousDraft = currentDraft
-        let saveStartedAt = ContinuousClock.now
         workingDrafts[key] = normalizedDraft
         saveStateBySourceId[key] = SaveState(phase: .saving, detail: nil)
 
@@ -357,7 +341,6 @@ final class SourceManagement {
                 selectedLeafIds: normalizedDraft.selectedLeafIds,
                 enabledTargets: normalizedDraft.enabledTargets
             )
-            await ensureMinimumSaveLoadingDuration(since: saveStartedAt)
             workingDrafts[key] = normalizedDraft
             saveStateBySourceId[key] = SaveState(phase: .saved, detail: nil)
             applyPostApplyResponse(response, sourceId: sourceId, scope: scope)
@@ -365,7 +348,6 @@ final class SourceManagement {
             delegate?.showToast(style: successStyle, text: successMessage)
         } catch {
             let firstReason = firstErrorLine(from: error)
-            await ensureMinimumSaveLoadingDuration(since: saveStartedAt)
             applyProjectScopeStateIfAvailable(from: error)
             workingDrafts[key] = previousDraft
             saveStateBySourceId[key] = SaveState(phase: .failed, detail: firstReason)
@@ -383,32 +365,6 @@ final class SourceManagement {
         let renamed = existing.renamed(displayName: displayName, originalDisplayName: originalDisplayName)
         if let index = allSummaries.firstIndex(where: { $0.sourceId == sourceId }) {
             allSummaries[index] = renamed
-        }
-    }
-
-    func invalidatePreparedDetailContent(for sourceId: String) {
-
-    }
-
-    func parseSummaries(from value: Any?) -> [WorkflowSummary] {
-        parseSummariesPayload(value)
-    }
-
-    func applyExternalSummaries(_ summaries: [WorkflowSummary]) {
-        allSummaries = summaries
-        for summary in summaries {
-            let key = ScopedSourceKey(scope: .global, sourceId: summary.sourceId)
-            let savePhase = saveStateBySourceId[key]?.phase ?? .idle
-
-            if savePhase == .saving {
-                if workingDrafts[key] == nil {
-                    workingDrafts[key] = buildInitialDraftFromSummary(summary: summary)
-                }
-            } else {
-                workingDrafts[key] = buildInitialDraftFromSummary(summary: summary)
-            }
-
-            detectedTargets.formUnion(summary.enabledTargets)
         }
     }
 
@@ -840,18 +796,6 @@ final class SourceManagement {
             recentlyUpdatedSourceKeys.remove(key)
             recentlyUpdatedClearTasksBySourceId.removeValue(forKey: key)
         }
-    }
-
-    private func cancelDeferredDraftSync() {
-    }
-
-    private func ensureMinimumSaveLoadingDuration(since start: ContinuousClock.Instant) async {
-        let minimum: Duration = .milliseconds(200)
-        let elapsed = start.duration(to: ContinuousClock.now)
-        guard elapsed < minimum else {
-            return
-        }
-        try? await Task.sleep(for: minimum - elapsed)
     }
 
     private func normalizedPinnedSourceIds(_ sourceIds: [String]) -> [String] {

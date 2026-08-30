@@ -48,6 +48,19 @@ describe.sequential("bridge command dispatcher", () => {
     expect(response.data).toHaveProperty("pinnedSourceIds");
   });
 
+  test("returns a workspace snapshot with update mutations", async () => {
+    const app = new SkillFlowApp();
+    const response = await executeBridgeRequest(app, {
+      protocolVersion: PROTOCOL_VERSION,
+      command: "update",
+      payload: { sourceIds: [] },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(response.data).toHaveProperty("workspace.summaries");
+    expect(response.data).toHaveProperty("workspace.initialDrafts");
+  });
+
   test("adopts and refreshes an external source through the bridge without enabling it", async () => {
     const externalPath = path.join(sandbox.sandboxRoot, "external-bridge");
     await writeRepoFiles(externalPath, {
@@ -120,22 +133,9 @@ describe.sequential("bridge command dispatcher", () => {
     expect(response.data).toHaveProperty("customTargets");
     expect(response.data).toHaveProperty("agentDisplayOrder");
     expect(response.data).toHaveProperty("capabilities", { importDraftV2: true });
-    expect(response.data).toMatchObject({
-      manifest: {
-        schemaVersion: 2,
-        bindings: {
-          [added.data.manifest.id]: expect.objectContaining({
-            sourceId: added.data.manifest.id,
-            enabledTargets: expect.any(Array),
-          }),
-        },
-      },
-      lockFile: {
-        schemaVersion: 2,
-        projections: expect.any(Array),
-      },
-    });
-    expect((response.data as any).lockFile.deployments).toBeUndefined();
+    expect(response.data).not.toHaveProperty("manifest");
+    expect(response.data).not.toHaveProperty("lockFile");
+    expect(response.data).not.toHaveProperty("audit");
   });
 
   test("save-settings preserves custom target path strings in runtime preferences", async () => {
@@ -924,7 +924,7 @@ describe.sequential("bridge command dispatcher", () => {
 
   test("accepts valid scan-local-import-groups payload", async () => {
     const app = {
-      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ groups: [], path })),
+      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ localScanGroups: [], path })),
     } as unknown as SkillFlowApp;
 
     const response = await executeBridgeRequest(app, {
@@ -939,7 +939,7 @@ describe.sequential("bridge command dispatcher", () => {
 
   test("rejects invalid scan-local-import-groups path payload", async () => {
     const app = {
-      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ groups: [], path })),
+      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ localScanGroups: [], path })),
     } as unknown as SkillFlowApp;
 
     const response = await executeBridgeRequest(app, {
@@ -955,7 +955,7 @@ describe.sequential("bridge command dispatcher", () => {
 
   test("accepts scan-local-import-groups without path payload", async () => {
     const app = {
-      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ groups: [], path })),
+      scanLocalImportGroups: vi.fn(async (path?: string) => ok({ localScanGroups: [], path })),
     } as unknown as SkillFlowApp;
 
     const responseWithoutPayload = await executeBridgeRequest(app, {
@@ -1083,6 +1083,7 @@ describe.sequential("bridge command dispatcher", () => {
     expect(response.ok).toBe(true);
     expect(response.data).toHaveProperty("status", "ready");
     expect(response.data).toHaveProperty("usedPreparation", true);
+    expect(response.data).toHaveProperty("workspace.summaries");
   });
 
   test("rejects import-source legacy selectedSkillIds payload", async () => {

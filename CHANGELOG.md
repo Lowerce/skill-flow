@@ -4,6 +4,41 @@ All notable changes to `skill-flow` will be documented in this file.
 
 ## Unreleased
 
+## v1.6.2 - 2026-08-29
+
+### Changed
+
+- Updated the CLI and all internal workspace packages from `1.6.1` to `1.6.2`.
+- Reduced desktop launch and home-screen work through cached workspace bootstrap, shared card projections, precomputed sorting, bounded geometry tracking, and cached visual metadata.
+- Parallelized independent update checks and import preparation with bounded concurrency while preserving serial recovery-journal commits.
+- Simplified import discovery, runtime mutation, desktop parsing, detail enrichment, and persisted cache boundaries by removing superseded compatibility paths and dead state.
+- Reduced Detail, Usage, Settings, and Import rendering work through bounded revisions, indexed heatmap activity, localized hover state, and visible-card prefetching.
+- Skill and target toggles now finish immediately after Apply completes instead of enforcing an artificial delay.
+
+- Local Skill scan bridge responses now expose only `localScanGroups`, and the macOS app consumes their final import-choice shape directly.
+- Local Skill scan now derives groups only from observed local paths and content hashes; legacy Agents lock origin inference is no longer part of scan behavior.
+- Removed unused persisted local import-choice snapshots from preferences; migration and settings writes now discard those rebuildable legacy fields.
+- Simplified disposable import preparation records to retain only checkout, lifecycle, retry, and recovery evidence.
+- Replaced the unused multi-provider import repository cache envelope with direct Skills source snapshots.
+- Recommendation loading now resolves all feeds and cached source cards from one cache read instead of serializing repeated full-file reads.
+- Removed the superseded RuntimeManifestView mutation helper chain now that source authority and deployment reconciliation own final mutations.
+- Exact GitHub import searches now use ImportDiscovery caching, stale fallback, and in-flight request sharing instead of bypassing the discovery boundary.
+- Removed obsolete whole-cache and update-preflight entry points superseded by granular cache writes and structured update prechecks.
+- Import Data cache entries now persist only expiry and consumed payloads; query/feed/repository keys no longer duplicate identity or unused timestamps inside each entry.
+- Desktop import locator and detail document parsing now have dedicated owners instead of compatibility copies on the app-wide view model.
+- Desktop detail titles now use the production title policy directly, including polluted shell-output rejection and normalized repository or ClawHub fallbacks.
+- Desktop document Tab/Descriptor conversion now lives on the document models instead of duplicated app-wide view-model helpers.
+- Desktop detail caching now uses one comprehensive revision policy, including nested stats, file-tree, document, target, and Skill presentation changes.
+- Desktop file-tree documents now render directly from tree items without unused line models or placeholder conversion adapters.
+- Desktop Home cards and Detail views now share one single-flight enrichment cache and recursive overlay policy, avoiding duplicate requests and stale appended leaf payloads.
+- Removed superseded update parsing, file-tree, toast, uninstall-selection, and label helpers from the desktop app-wide view model.
+- Removed unused Import/GitHub integration exports and a stale handwritten declaration that no longer matched the TypeScript implementation.
+
+### Fixed
+
+- Desktop detail links now reject sibling directories whose names merely share the managed repository path prefix.
+- Detail views now publish completion when background warmup finishes, preventing stale loading state without refreshing Home.
+
 ## v1.6.1 - 2026-08-27
 
 ### Changed

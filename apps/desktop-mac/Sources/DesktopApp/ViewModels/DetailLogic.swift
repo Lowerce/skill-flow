@@ -1,7 +1,6 @@
 import Foundation
 import Observation
 import CryptoKit
-import Yams
 
 @MainActor
 @Observable
@@ -85,20 +84,6 @@ final class DetailLogic {
         let displayTitle: String
     }
 
-    private struct ParsedDocument: Sendable {
-        let frontMatter: SkillFrontMatter?
-        let metadata: [MetadataEntry]
-        let body: String
-    }
-
-    private struct SkillFrontMatter: Decodable, Sendable {
-        let name: String?
-        let description: String?
-        let version: String?
-    }
-
-    private let detailEnrichmentQuery: any DesktopDetailEnrichmentQuerying
-    private let warningsSink: ([BridgeIssue]) -> Void
     private let detailDocumentStore: DetailDocumentStore
 
     @ObservationIgnored
@@ -113,36 +98,22 @@ final class DetailLogic {
     @ObservationIgnored
     private var detailWarmupTokenSeed: UInt64 = 0
 
+    private var preparedContentRevision: UInt64 = 0
+
     @ObservationIgnored
     var detailWarmupDelay: Duration = .milliseconds(40)
 
-    @ObservationIgnored
-    private var detailEnrichmentPayloadBySourceId: [String: [String: Any]] = [:]
-
-    @ObservationIgnored
-    private var detailEnrichmentTasksBySourceId: [String: Task<Void, Never>] = [:]
-
-    @ObservationIgnored
-    private var detailEnrichmentTokensBySourceId: [String: UInt64] = [:]
-
-    @ObservationIgnored
-    private var detailEnrichmentTokenSeed: UInt64 = 0
-
-    init(
-        detailEnrichmentQuery: any DesktopDetailEnrichmentQuerying,
-        warningsSink: @escaping ([BridgeIssue]) -> Void
-    ) {
-        self.detailEnrichmentQuery = detailEnrichmentQuery
-        self.warningsSink = warningsSink
+    init() {
         self.detailDocumentStore = DetailDocumentStore()
     }
 
-    func detailViewData(for input: DetailInput) -> DetailViewData {
+    func detailViewData(for input: DetailInput, schedulesWarmup: Bool = true) -> DetailViewData {
+        _ = preparedContentRevision
         let summary = input.summary
         let draft = input.draft
         let sourceId = summary.sourceId
 
-        let payload = mergedDetailPayload(basePayload: input.inspectedPayload, sourceId: sourceId)
+        let payload = input.inspectedPayload
         let sourcePayload = payload["source"] as? [String: Any] ?? [:]
         let summaryPayload = payload["summary"] as? [String: Any] ?? [:]
         let summarySourcePayload = summaryPayload["source"] as? [String: Any] ?? [:]
@@ -169,7 +140,7 @@ final class DetailLogic {
         let starCount = groupStats.starCount
         let projectedNamesByLeafId = input.projectedNamesByLeafId
 
-        if preparedDetailContent == nil, !payload.isEmpty {
+        if schedulesWarmup, preparedDetailContent == nil, !payload.isEmpty {
             scheduleDetailContentWarmupIfNeeded(input: input)
         }
 
@@ -267,7 +238,7 @@ final class DetailLogic {
         let locator = (sourcePayload["locator"] as? String)?.nonEmpty ?? summary.sourceLocator
         let updatedAt = (lockPayload["updatedAt"] as? String)?.nonEmpty ?? summary.updatedAt
         let updatedRelative = input.updatedRelative
-        let revision = detailRevision(
+        let revision = DetailRevision.make(
             sourceId: summary.sourceId,
             title: title,
             originalDisplayName: originalDisplayName,
@@ -329,7 +300,7 @@ final class DetailLogic {
             sourceFacts: sourceFacts,
             deploymentFacts: deploymentFacts,
             fileTree: fileTree,
-            groupDocuments: placeholderDocumentTabs(groupDocumentDescriptors),
+            groupDocuments: groupDocumentDescriptors.map(\.placeholderTab),
             targets: targets,
             skills: skills
         )
@@ -353,7 +324,7 @@ final class DetailLogic {
                     title: descriptor.title,
                     path: descriptor.path,
                     metadata: descriptor.metadata,
-                    content: Self.renderFileTree(preparedContent.fileTree),
+                    content: FileTreeRenderer.render(preparedContent.fileTree),
                     renderCacheKey: descriptor.renderCacheKey,
                     externalURL: descriptor.externalURL
                 )
@@ -373,7 +344,7 @@ final class DetailLogic {
             return placeholder
         }
 
-        return await loadedDocumentTab(from: documentDescriptor(for: placeholder))
+        return await loadedDocumentTab(from: placeholder.descriptor)
     }
 
     private func loadedDocumentTab(from descriptor: DocumentDescriptor) async -> DocumentTab? {
@@ -399,50 +370,6 @@ final class DetailLogic {
                 externalURL: descriptor.externalURL
             )
         }
-    }
-
-    func scheduleDetailEnrichmentFetch(input: DetailInput, force: Bool = false) {
-        let sourceId = input.summary.sourceId
-        if !force, detailEnrichmentTasksBySourceId[sourceId] != nil {
-            return
-        }
-        if force {
-            detailEnrichmentTasksBySourceId[sourceId]?.cancel()
-            detailEnrichmentTasksBySourceId.removeValue(forKey: sourceId)
-        }
-
-        detailEnrichmentTokenSeed &+= 1
-        let token = detailEnrichmentTokenSeed
-        detailEnrichmentTokensBySourceId[sourceId] = token
-
-        let task = Task { @MainActor [weak self, sourceId] in
-            guard let self else { return }
-            do {
-                let response = try await self.detailEnrichmentQuery.inspectEnrichment(sourceId: sourceId)
-                guard !Task.isCancelled else { return }
-
-                if let payload = response.data?.value as? [String: Any],
-                   self.detailEnrichmentTokensBySourceId[sourceId] == token
-                {
-                    self.detailEnrichmentPayloadBySourceId[sourceId] = self.mergedDetailEnrichmentPayload(
-                        existing: self.detailEnrichmentPayloadBySourceId[sourceId] ?? [:],
-                        incoming: payload
-                    )
-                }
-                if self.detailEnrichmentTokensBySourceId[sourceId] == token {
-                    self.warningsSink(response.warnings)
-                    self.detailEnrichmentTasksBySourceId.removeValue(forKey: sourceId)
-                    self.detailEnrichmentTokensBySourceId.removeValue(forKey: sourceId)
-                }
-            } catch {
-                if self.detailEnrichmentTokensBySourceId[sourceId] == token {
-                    self.detailEnrichmentTasksBySourceId.removeValue(forKey: sourceId)
-                    self.detailEnrichmentTokensBySourceId.removeValue(forKey: sourceId)
-                }
-            }
-        }
-
-        detailEnrichmentTasksBySourceId[sourceId] = task
     }
 
     func scheduleDetailContentWarmupIfNeeded(input: DetailInput) {
@@ -485,6 +412,7 @@ final class DetailLogic {
                     return
                 }
                 self.preparedDetailContentBySourceId[sourceId] = prepared
+                self.preparedContentRevision &+= 1
             }
         }
         detailWarmupTasksBySourceId[sourceId] = task
@@ -496,29 +424,12 @@ final class DetailLogic {
         detailWarmupTasksBySourceId.removeValue(forKey: sourceId)
         detailWarmupTokenSeed &+= 1
         detailWarmupTokensBySourceId[sourceId] = detailWarmupTokenSeed
+        preparedContentRevision &+= 1
     }
 
-    private func mergedDetailPayload(basePayload: [String: Any], sourceId: String) -> [String: Any] {
-        var payload = basePayload
-        let enrichmentPayload = detailEnrichmentPayloadBySourceId[sourceId] ?? [:]
-        payload = mergedDetailEnrichmentPayload(existing: payload, incoming: enrichmentPayload)
-        return payload
-    }
-
-    private func mergedDetailEnrichmentPayload(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
-        var merged = existing
-        for (key, value) in incoming {
-            if let existingArray = merged[key] as? [Any],
-               let incomingArray = value as? [Any] {
-                merged[key] = existingArray + incomingArray
-            } else if let existingObject = merged[key] as? [String: Any],
-                      let incomingObject = value as? [String: Any] {
-                merged[key] = mergedDetailEnrichmentPayload(existing: existingObject, incoming: incomingObject)
-            } else {
-                merged[key] = value
-            }
-        }
-        return merged
+    func hasPreparedOrScheduledDetailContent(for sourceId: String) -> Bool {
+        preparedDetailContentBySourceId[sourceId] != nil
+            || detailWarmupTasksBySourceId[sourceId] != nil
     }
 
     private func buildPreparedDetailWarmupInput(input: DetailInput) -> PreparedDetailWarmupInput {
@@ -748,14 +659,37 @@ final class DetailLogic {
     }
 
     nonisolated private static func sanitizedDetailTitle(_ value: String?) -> String? {
-        value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        let lowercase = trimmed.lowercased()
+        let rejectedFragments = [
+            "zsh-compatible:",
+            "use find",
+            "no such file",
+            "command not found",
+            "permission denied",
+        ]
+        return rejectedFragments.contains(where: lowercase.contains) ? nil : trimmed
     }
 
     nonisolated private static func detailTitleFallback(from locator: String, sourceId: String) -> String {
-        if let lastComponent = locator.split(separator: "/").last, !lastComponent.isEmpty {
-            return String(lastComponent)
+        let trimmed = locator
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ".git", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        guard !trimmed.isEmpty else {
+            return sourceId
         }
-        return sourceId
+
+        if locator.hasPrefix("clawhub:"),
+           let slug = locator.split(separator: ":").last?.split(separator: "@").first {
+            return String(slug.split(separator: "/").last ?? Substring(sourceId))
+        }
+
+        return trimmed.split(separator: "/").last.map(String.init) ?? sourceId
     }
 
     private static func formattedCount(_ value: Int) -> String {
@@ -770,99 +704,6 @@ final class DetailLogic {
         if normalizedKind == "collection" { return localizedWarmup("source.author.collection") }
         if let handle = authorHandle(from: locator) { return handle }
         return normalizedKind
-    }
-
-    nonisolated func placeholderDocumentTabs(_ descriptors: [DocumentDescriptor]) -> [DocumentTab] {
-        descriptors.map {
-            DocumentTab(
-                id: $0.id,
-                title: $0.title,
-                path: $0.path,
-                metadata: $0.metadata,
-                content: "",
-                renderCacheKey: $0.renderCacheKey,
-                externalURL: $0.externalURL,
-                isLoaded: false
-            )
-        }
-    }
-
-    nonisolated func documentDescriptor(for tab: DocumentTab) -> DocumentDescriptor {
-        DocumentDescriptor(
-            id: tab.id,
-            title: tab.title,
-            path: tab.path,
-            metadata: tab.metadata,
-            renderCacheKey: tab.renderCacheKey,
-            externalURL: tab.externalURL
-        )
-    }
-
-    nonisolated func detailRevision(
-        sourceId: String,
-        title: String,
-        originalDisplayName: String,
-        subtitle: String,
-        author: String,
-        originLabel: String,
-        starCount: Int?,
-        groupStats: GroupCardStats,
-        sourceDetailLines: [String],
-        sourceRepositoryURL: String?,
-        locator: String,
-        groupPath: String?,
-        updatedAt: String,
-        updatedRelative: String,
-        health: String,
-        warningCount: Int,
-        errorCount: Int,
-        enabledSkillCount: Int,
-        totalSkillCount: Int,
-        enabledTargetCount: Int,
-        saveState: SaveState,
-        skillSelection: SelectionState,
-        targetSelection: SelectionState,
-        enabledTargetLabels: [String],
-        sourceFacts: [String],
-        deploymentFacts: [String],
-        fileTree: [FileTreeItem],
-        groupDocuments: [DocumentDescriptor],
-        targets: [DetailTarget],
-        skills: [DetailSkill]
-    ) -> String {
-        var hasher = Hasher()
-        hasher.combine(sourceId)
-        hasher.combine(title)
-        hasher.combine(originalDisplayName)
-        hasher.combine(subtitle)
-        hasher.combine(author)
-        hasher.combine(originLabel)
-        hasher.combine(starCount)
-        hasher.combine(groupStats.githubURL)
-        hasher.combine(sourceDetailLines)
-        hasher.combine(sourceRepositoryURL)
-        hasher.combine(locator)
-        hasher.combine(groupPath)
-        hasher.combine(updatedAt)
-        hasher.combine(updatedRelative)
-        hasher.combine(health)
-        hasher.combine(warningCount)
-        hasher.combine(errorCount)
-        hasher.combine(enabledSkillCount)
-        hasher.combine(totalSkillCount)
-        hasher.combine(enabledTargetCount)
-        hasher.combine(saveState.phase.rawValue)
-        hasher.combine(saveState.detail)
-        hasher.combine(skillSelection.rawValue)
-        hasher.combine(targetSelection.rawValue)
-        hasher.combine(enabledTargetLabels)
-        hasher.combine(sourceFacts)
-        hasher.combine(deploymentFacts)
-        hasher.combine(fileTree.map { $0.id })
-        hasher.combine(groupDocuments.map { $0.id })
-        hasher.combine(targets.map { $0.id })
-        hasher.combine(skills.map { $0.id })
-        return String(hasher.finalize(), radix: 16)
     }
 
     nonisolated private static func sortedDetailSkills(_ skills: [DetailSkill]) -> [DetailSkill] {
@@ -1013,69 +854,8 @@ final class DetailLogic {
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
             return nil
         }
-        let parsed = parseDetailDocument(raw)
+        let parsed = DetailDocumentParser.parse(raw)
         return parsed.body.isEmpty ? nil : parsed.body
-    }
-
-    nonisolated static func parseDetailDocument(_ content: String) -> (metadata: [MetadataEntry], body: String) {
-        let parsed = parseDocument(content)
-        return (metadata: parsed.metadata, body: parsed.body)
-    }
-
-    nonisolated private static func parseDocument(_ content: String) -> ParsedDocument {
-        let lines = content.components(separatedBy: .newlines)
-        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" else {
-            return ParsedDocument(frontMatter: nil, metadata: [], body: content.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        guard let closingIndex = lines.dropFirst().firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines) == "---"
-        }) else {
-            return ParsedDocument(frontMatter: nil, metadata: [], body: content.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        let frontMatterText = Array(lines[1..<closingIndex]).joined(separator: "\n")
-        let metadata = parseFrontmatterEntries(frontMatterText)
-        let frontMatter = parseFrontMatter(frontMatterText)
-        let bodyLines = closingIndex + 1 < lines.count ? Array(lines[(closingIndex + 1)...]) : []
-        let body = bodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return ParsedDocument(frontMatter: frontMatter, metadata: metadata, body: body)
-    }
-
-    nonisolated private static func parseFrontMatter(_ frontMatterText: String) -> SkillFrontMatter? {
-        try? YAMLDecoder().decode(SkillFrontMatter.self, from: frontMatterText)
-    }
-
-    nonisolated private static func parseFrontmatterEntries(_ frontMatterText: String) -> [MetadataEntry] {
-        guard let dictionary = (try? Yams.load(yaml: frontMatterText)) as? [String: Any] else {
-            return []
-        }
-
-        return dictionary.keys.sorted().compactMap { key in
-            guard let value = dictionary[key] else {
-                return nil
-            }
-
-            let renderedValue = stringifyMetadataValue(value)
-            return MetadataEntry(id: "\(key):\(renderedValue)", key: key, value: renderedValue)
-        }
-    }
-
-    nonisolated private static func stringifyMetadataValue(_ value: Any) -> String {
-        switch value {
-        case let string as String:
-            return string
-        case let number as NSNumber:
-            return number.stringValue
-        case let values as [Any]:
-            return values.map(stringifyMetadataValue).joined(separator: ", ")
-        case let dictionary as [String: Any]:
-            return dictionary.keys.sorted()
-                .map { "\($0): \(stringifyMetadataValue(dictionary[$0] as Any))" }
-                .joined(separator: ", ")
-        default:
-            return String(describing: value)
-        }
     }
 
     nonisolated private static func groupDocumentDescriptors(
@@ -1148,14 +928,14 @@ final class DetailLogic {
         return 3
     }
 
-    nonisolated private static func relativePath(from basePath: String, to targetPath: String) -> String? {
-        let standardizedBase = URL(fileURLWithPath: basePath).standardizedFileURL.path
-        let standardizedTarget = URL(fileURLWithPath: targetPath).standardizedFileURL.path
-        guard standardizedTarget.hasPrefix(standardizedBase) else {
+    nonisolated static func relativePath(from basePath: String, to targetPath: String) -> String? {
+        let baseComponents = URL(fileURLWithPath: basePath).standardizedFileURL.pathComponents
+        let targetComponents = URL(fileURLWithPath: targetPath).standardizedFileURL.pathComponents
+        guard targetComponents.starts(with: baseComponents) else {
             return nil
         }
-        let suffix = String(standardizedTarget.dropFirst(standardizedBase.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return suffix.isEmpty ? "." : suffix
+        let relativeComponents = targetComponents.dropFirst(baseComponents.count)
+        return relativeComponents.isEmpty ? "." : relativeComponents.joined(separator: "/")
     }
 
     nonisolated private static func projectedRelativeFolderPath(
@@ -1186,11 +966,14 @@ final class DetailLogic {
         }
 
         let standardizedRootPath = URL(fileURLWithPath: groupPath).standardizedFileURL.path
+        let skillReferencesByPath = Dictionary(uniqueKeysWithValues: skillReferences.map { ($0.folderPath, $0) })
+        let skillRootPaths = Set(skillReferencesByPath.keys)
         guard FileManager.default.fileExists(atPath: standardizedRootPath),
               let rootItem = buildFileTreeItem(
                   at: standardizedRootPath,
                   rootDisplayTitle: rootName,
-                  skillReferencesByPath: Dictionary(uniqueKeysWithValues: skillReferences.map { ($0.folderPath, $0) })
+                  skillReferencesByPath: skillReferencesByPath,
+                  skillRootPaths: skillRootPaths
               )
         else {
             return buildSyntheticFileTreeItems(rootName: rootName, skills: skillReferences)
@@ -1242,14 +1025,14 @@ final class DetailLogic {
     nonisolated private static func buildFileTreeItem(
         at path: String,
         rootDisplayTitle: String? = nil,
-        skillReferencesByPath: [String: FileTreeSkillReference]
+        skillReferencesByPath: [String: FileTreeSkillReference],
+        skillRootPaths: Set<String>
     ) -> FileTreeItem? {
         let standardizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
         let url = URL(fileURLWithPath: standardizedPath)
         let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
         let isDirectory = values?.isDirectory ?? false
         let skillReference = skillReferencesByPath[standardizedPath]
-        let skillRootPaths = Set(skillReferencesByPath.keys)
         let title = rootDisplayTitle
             ?? skillReference?.displayTitle
             ?? url.lastPathComponent.nonEmpty
@@ -1264,9 +1047,19 @@ final class DetailLogic {
            ) {
             children = entries
                 .compactMap { entry in
-                    buildFileTreeItem(
+                    let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                    if isDirectory,
+                       !shouldTraverseFileTreeDirectory(
+                           at: entry.path,
+                           currentSkillRootPath: skillReference?.folderPath,
+                           skillRootPaths: skillRootPaths
+                       ) {
+                        return nil
+                    }
+                    return buildFileTreeItem(
                         at: entry.path,
-                        skillReferencesByPath: skillReferencesByPath
+                        skillReferencesByPath: skillReferencesByPath,
+                        skillRootPaths: skillRootPaths
                     )
                 }
                 .filter { item in
@@ -1304,6 +1097,17 @@ final class DetailLogic {
                 ?? (isSkillDocument ? skillReferencesByPath[url.deletingLastPathComponent().path]?.skillId : nil),
             children: children
         )
+    }
+
+    nonisolated static func shouldTraverseFileTreeDirectory(
+        at path: String,
+        currentSkillRootPath: String?,
+        skillRootPaths: Set<String>
+    ) -> Bool {
+        guard currentSkillRootPath == nil else {
+            return false
+        }
+        return containsSkillRootDescendant(path, skillRootPaths: skillRootPaths)
     }
 
     nonisolated private static func shouldIncludeFileTreeItem(
@@ -1354,7 +1158,7 @@ final class DetailLogic {
         }
 
         return [
-            fileTreeItems(from: root, parentPath: rootName, skillReferencesByPath: Dictionary(uniqueKeysWithValues: skills.map { ($0.folderPath, $0) }))
+            fileTreeItems(from: root, parentPath: rootName)
         ]
     }
 
@@ -1373,8 +1177,7 @@ final class DetailLogic {
 
     nonisolated private static func fileTreeItems(
         from node: FileTreeNode,
-        parentPath: String,
-        skillReferencesByPath _: [String: FileTreeSkillReference]
+        parentPath: String
     ) -> FileTreeItem {
         let itemPath = parentPath
         let children = node.children.values
@@ -1387,8 +1190,7 @@ final class DetailLogic {
             .map { child in
                 fileTreeItems(
                     from: child,
-                    parentPath: "\(parentPath)/\(child.name)",
-                    skillReferencesByPath: [:]
+                    parentPath: "\(parentPath)/\(child.name)"
                 )
             }
         return FileTreeItem(
@@ -1411,59 +1213,6 @@ final class DetailLogic {
             return compareRootDocumentNames(lhs.title, rhs.title)
         }
         return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
-    }
-
-    nonisolated private static func renderFileTree(_ items: [FileTreeItem]) -> String {
-        renderFileTreeLines(items).map { "\($0.prefix)\($0.title)" }.joined(separator: "\n")
-    }
-
-    nonisolated private static func renderFileTreeLines(_ items: [FileTreeItem]) -> [FileTreeLine] {
-        var lines: [FileTreeLine] = []
-        for (index, item) in items.enumerated() {
-            lines.append(
-                FileTreeLine(
-                    id: item.id,
-                    depth: 0,
-                    prefix: "",
-                    title: item.title,
-                    isFile: !item.isDirectory
-                )
-            )
-            appendRenderedFileTreeLines(
-                from: item.children,
-                depth: 1,
-                ancestry: [index == items.count - 1],
-                into: &lines
-            )
-        }
-        return lines
-    }
-
-    nonisolated private static func appendRenderedFileTreeLines(
-        from items: [FileTreeItem],
-        depth: Int,
-        ancestry: [Bool],
-        into lines: inout [FileTreeLine]
-    ) {
-        for (index, item) in items.enumerated() {
-            let isLast = index == items.count - 1
-            let branch = ancestry.dropLast().map { $0 ? "    " : "|   " }.joined() + (isLast ? "`-- " : "|-- ")
-            lines.append(
-                FileTreeLine(
-                    id: item.id,
-                    depth: depth,
-                    prefix: branch,
-                    title: item.title,
-                    isFile: !item.isDirectory
-                )
-            )
-            appendRenderedFileTreeLines(
-                from: item.children,
-                depth: depth + 1,
-                ancestry: ancestry + [isLast],
-                into: &lines
-            )
-        }
     }
 
     nonisolated private static func enrichDocumentTabs(
